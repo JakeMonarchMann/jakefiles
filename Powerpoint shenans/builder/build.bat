@@ -2,15 +2,12 @@
 REM Double-click to build the EXE into builder\dist\.
 cd /d "%~dp0"
 
-REM Prefer the project's own .venv (has the app's deps, e.g. pywin32)
-REM so the build doesn't silently omit them; fall back to `py`/`python`.
-if exist "..\.venv\Scripts\python.exe" (
-    set PYCMD="..\.venv\Scripts\python.exe"
-    goto :run
-)
-set PYCMD=py
+REM Prefer `python` on PATH -- same interpreter run_gui.bat uses, so its
+REM installed deps (pywin32, etc.) get bundled. Fall back to the `py`
+REM launcher only if `python` isn't on PATH.
+set PYCMD=python
 %PYCMD% --version >nul 2>nul
-if errorlevel 1 set PYCMD=python
+if errorlevel 1 set PYCMD=py
 %PYCMD% --version >nul 2>nul
 if errorlevel 1 (
     echo Python was not found on PATH.
@@ -19,7 +16,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:run
 %PYCMD% build_exe.py
 set RC=%ERRORLEVEL%
 
