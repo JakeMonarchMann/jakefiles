@@ -6,10 +6,12 @@ Themed desktop app that builds a snake-flow block diagram directly inside an
 
   1. Open PowerPoint with the presentation you want to draw on.
   2. Run:  python snake_gui.py     (or double-click run_gui.bat)
-  3. Type one item per line, tweak the settings, click "Insert into PowerPoint".
+  3. Type one item per line in the app, tweak the settings, click
+     "Insert into PowerPoint". The in-app "How to use" panel walks through
+     the rest (loading an existing diagram back in, reformatting, etc.).
 
-Round-trips too: "Load from slide" pulls the numbered list back out of the
-active slide (notes first, then the boxes) so you can edit and re-insert.
+Round-trips too: "Load from slide notes" / "Load from slide content" pull
+the list back out of the active slide so you can edit and re-insert.
 
 Requires:  pip install pywin32
 Windows + desktop PowerPoint only (COM automation).
@@ -539,33 +541,64 @@ def _ordered_shapes_and_items(slide):
     return items, shapes
 
 
-def read_items_from_active(app):
-    """Recover the item list from the active slide.
-    Priority: (1) notes numbered list, (2) box_XXX named shapes,
-    (3) any AutoShape with text, sorted by position.
-    """
-    pres  = _active_presentation(app)
-    slide = app.ActiveWindow.View.Slide
-
-    lines = _notes_textframe(slide).TextRange.Text.splitlines()
-    items = [_strip_number(ln) for ln in lines if ln.strip()]
-    if items:
-        return items
-
-    boxes = [s for s in slide.Shapes if s.Name.startswith("box_")]
-    if boxes:
-        boxes.sort(key=lambda s: int(s.Name.split("_")[1]))
-        return [_strip_number(s.TextFrame.TextRange.Text) for s in boxes]
-
-    return _read_autoboxes_ordered(slide)
-
-
 # ══════════════════════════════ GUI ══════════════════════════════════════════
+
+class _Tooltip:
+    """Hover tooltip for any widget, styled like a sticky note (matches the
+    brand theme's TIP_BG/TIP_FG). Attach with `_tip(widget, "explanation")`."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<ButtonPress>", self._hide)
+
+    def _show(self, _event=None):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 4
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(tw, text=self.text, justify="left",
+                background=theme.TIP_BG, foreground=theme.TIP_FG,
+                relief="solid", borderwidth=1, padx=6, pady=4,
+                wraplength=280).pack()
+
+    def _hide(self, _event=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+def _tip(widget, text):
+    _Tooltip(widget, text)
+    return widget
+
+
+HOW_TO_USE = (
+    "1.  Open PowerPoint with the presentation you want to draw on.\n"
+    "2.  Type one item per line below — each line becomes one box.\n"
+    "3.  Adjust the settings on the right if you want (hover over a "
+    "setting to see what it does).\n"
+    "4.  Pick \"New slide\" or \"Active slide\" under Draw on.\n"
+    "5.  Click \"Insert into PowerPoint\".\n\n"
+    "Already have a diagram on the slide? Click \"Load from slide notes\" "
+    "or \"Load from slide content\" first to pull its list into the box "
+    "below, edit it, then use \"Insert\" (redraws everything) or "
+    "\"Reformat slide (beta)\" (just moves the existing boxes — keeps "
+    "their wording and formatting; save first, it's still rough)."
+)
+
 
 class SnakeApp:
     def __init__(self, root):
         self.root = root
-        root.title("Snake Diagram Builder")
+        root.title("Snake Diagram Builder  v1.1.0")
+        root.minsize(760, 560)
         self.family = theme.apply_theme(root)
 
         self._build()
@@ -576,75 +609,178 @@ class SnakeApp:
         outer = ttk.Frame(root, padding=12)
         outer.pack(fill="both", expand=True)
 
+        # How-to-use guide — always visible so nothing is assumed knowledge.
+        guide = ttk.Labelframe(outer, text="How to use", padding=8)
+        guide.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        ttk.Label(guide, text=HOW_TO_USE, justify="left",
+                 wraplength=700).pack(anchor="w")
+
+        # Items (the diagram's content, typed directly here)
+        left = ttk.Labelframe(outer, text="Diagram items", padding=8)
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+
+        ttk.Label(left, text="One item per line:").pack(anchor="w")
+        items_frame = ttk.Frame(left)
+        items_frame.pack(fill="both", expand=True, pady=(2, 6))
+        self.items_txt = tk.Text(items_frame, height=12, width=32, wrap="word",
+                                 undo=True)
+        items_scroll = ttk.Scrollbar(items_frame, orient="vertical",
+                                    command=self.items_txt.yview)
+        self.items_txt.configure(yscrollcommand=items_scroll.set)
+        self.items_txt.pack(side="left", fill="both", expand=True)
+        items_scroll.pack(side="right", fill="y")
+        _tip(self.items_txt,
+            "Each line becomes one box, in order. Blank lines are ignored.")
+
+        load_row = ttk.Frame(left)
+        load_row.pack(fill="x")
+        load_notes_btn = ttk.Button(load_row, text="Load from slide notes",
+                                   command=self.on_load_notes)
+        load_notes_btn.pack(side="left")
+        _tip(load_notes_btn,
+            "Reads the item list typed in the active slide's Notes pane "
+            "into the box above, so you can edit it here.")
+        load_shapes_btn = ttk.Button(load_row, text="Load from slide content",
+                                    command=self.on_load_shapes)
+        load_shapes_btn.pack(side="left", padx=(6, 0))
+        _tip(load_shapes_btn,
+            "Ignores the notes and instead reads the text already on the "
+            "slide's boxes/shapes into the box above, so you can edit it "
+            "here.")
+        sync_btn = ttk.Button(load_row, text="Sync edited boxes",
+                              command=self.on_extract)
+        sync_btn.pack(side="left", padx=(6, 0))
+        _tip(sync_btn,
+            "If you manually edited a box's text or formatting directly in "
+            "PowerPoint, click this to pull those changes back into the "
+            "item list (and the slide's notes) so Reformat/Insert stay in "
+            "sync.")
+
         # Settings
         right = ttk.Labelframe(outer, text="Settings", padding=8)
-        right.grid(row=0, column=0, sticky="nsew")
+        right.grid(row=1, column=1, sticky="nsew")
 
-        ttk.Label(right, text="Slide title").grid(row=0, column=0, sticky="w", pady=3)
+        r = 0
+        ttk.Label(right, text="Slide title").grid(row=r, column=0, sticky="w", pady=3)
         self.title_var = tk.StringVar(value=DEFAULTS["title"])
-        ttk.Entry(right, textvariable=self.title_var, width=22).grid(
-            row=0, column=1, sticky="ew", pady=3)
+        _tip(ttk.Entry(right, textvariable=self.title_var, width=22),
+            "Optional heading placed above the diagram. Leave blank for no "
+            "title.").grid(row=r, column=1, sticky="ew", pady=3)
 
-        ttk.Label(right, text="Boxes per row").grid(row=1, column=0, sticky="w", pady=3)
+        r += 1
+        ttk.Label(right, text="Boxes per row").grid(row=r, column=0, sticky="w", pady=3)
         self.bpr_var = tk.IntVar(value=DEFAULTS["boxes_per_row"])
-        ttk.Spinbox(right, from_=1, to=20, textvariable=self.bpr_var,
-                    width=6).grid(row=1, column=1, sticky="w", pady=3)
+        _tip(ttk.Spinbox(right, from_=1, to=20, textvariable=self.bpr_var,
+                        width=6),
+            "How many boxes fit in one row before wrapping to the next "
+            "row.").grid(row=r, column=1, sticky="w", pady=3)
 
-        ttk.Label(right, text="Layout").grid(row=2, column=0, sticky="w", pady=3)
+        r += 1
+        ttk.Label(right, text="Layout").grid(row=r, column=0, sticky="w", pady=3)
         self.layout_var = tk.StringVar(value=DEFAULTS["layout"])
-        ttk.Combobox(right, textvariable=self.layout_var, state="readonly",
-                     width=14, values=["wrap", "serpentine"]).grid(
-            row=2, column=1, sticky="w", pady=3)
+        _tip(ttk.Combobox(right, textvariable=self.layout_var, state="readonly",
+                         width=14, values=["wrap", "serpentine"]),
+            "wrap: every row reads left to right.\n"
+            "serpentine: alternate rows reverse direction (like a snake) — "
+            "useful for long lists that fold back and forth.").grid(
+            row=r, column=1, sticky="w", pady=3)
 
+        r += 1
         self.num_var = tk.BooleanVar(value=DEFAULTS["number_items"])
-        ttk.Checkbutton(right, text="Number the items",
-                        variable=self.num_var).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(8, 3))
+        _tip(ttk.Checkbutton(right, text="Number the items",
+                            variable=self.num_var),
+            "Adds \"1.\", \"2.\", ... in front of each box's text.").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(8, 3))
 
-        ttk.Label(right, text="Row gap (in)").grid(row=4, column=0, sticky="w", pady=3)
+        r += 1
+        ttk.Label(right, text="Row gap (in)").grid(row=r, column=0, sticky="w", pady=3)
         self.gapy_var = tk.DoubleVar(value=DEFAULTS["gap_y"])
-        ttk.Spinbox(right, from_=0.1, to=5.0, increment=0.05,
-                    textvariable=self.gapy_var, width=6,
-                    format="%.2f").grid(row=4, column=1, sticky="w", pady=3)
+        _tip(ttk.Spinbox(right, from_=0.1, to=5.0, increment=0.05,
+                        textvariable=self.gapy_var, width=6, format="%.2f"),
+            "Vertical space between rows of boxes, in inches.").grid(
+            row=r, column=1, sticky="w", pady=3)
 
-        ttk.Label(right, text="Column gap (in)").grid(row=5, column=0, sticky="w", pady=3)
+        r += 1
+        ttk.Label(right, text="Column gap (in)").grid(row=r, column=0, sticky="w", pady=3)
         self.gapx_var = tk.DoubleVar(value=DEFAULTS["gap_x"])
-        ttk.Spinbox(right, from_=0.05, to=5.0, increment=0.05,
-                    textvariable=self.gapx_var, width=6,
-                    format="%.2f").grid(row=5, column=1, sticky="w", pady=3)
+        _tip(ttk.Spinbox(right, from_=0.05, to=5.0, increment=0.05,
+                        textvariable=self.gapx_var, width=6, format="%.2f"),
+            "Horizontal space between boxes in the same row, in inches.").grid(
+            row=r, column=1, sticky="w", pady=3)
 
-        ttk.Separator(right).grid(row=6, column=0, columnspan=2,
+        r += 1
+        ttk.Label(right, text="Box width (in)").grid(row=r, column=0, sticky="w", pady=3)
+        self.boxw_var = tk.DoubleVar(value=DEFAULTS["box_w"])
+        _tip(ttk.Spinbox(right, from_=0.5, to=6.0, increment=0.05,
+                        textvariable=self.boxw_var, width=6, format="%.2f"),
+            "Width of each box, in inches.").grid(row=r, column=1, sticky="w", pady=3)
+
+        r += 1
+        ttk.Label(right, text="Box height (in)").grid(row=r, column=0, sticky="w", pady=3)
+        self.boxh_var = tk.DoubleVar(value=DEFAULTS["box_h"])
+        _tip(ttk.Spinbox(right, from_=0.3, to=6.0, increment=0.05,
+                        textvariable=self.boxh_var, width=6, format="%.2f"),
+            "Height of each box, in inches.").grid(row=r, column=1, sticky="w", pady=3)
+
+        r += 1
+        ttk.Label(right, text=f"Font: {DEFAULTS['font_name']} "
+                             f"{DEFAULTS['font_size']}pt (fixed, shrinks to "
+                             "fit)", foreground=theme.MUTED,
+                 wraplength=200, justify="left").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        r += 1
+        ttk.Separator(right).grid(row=r, column=0, columnspan=2,
                                   sticky="ew", pady=8)
 
-        ttk.Label(right, text="Draw on").grid(row=7, column=0, sticky="w", pady=3)
+        r += 1
+        ttk.Label(right, text="Draw on").grid(row=r, column=0, sticky="w", pady=3)
         self.target_var = tk.StringVar(value="new")
         tf = ttk.Frame(right)
-        tf.grid(row=7, column=1, sticky="w")
-        ttk.Radiobutton(tf, text="New slide", value="new",
-                        variable=self.target_var).pack(anchor="w")
-        ttk.Radiobutton(tf, text="Active slide", value="active",
-                        variable=self.target_var).pack(anchor="w")
+        tf.grid(row=r, column=1, sticky="w")
+        _tip(ttk.Radiobutton(tf, text="New slide", value="new",
+                            variable=self.target_var),
+            "Adds a fresh slide for this diagram.").pack(anchor="w")
+        _tip(ttk.Radiobutton(tf, text="Active slide", value="active",
+                            variable=self.target_var),
+            "Draws directly on whichever slide is open in PowerPoint right "
+            "now. Use this the first time you draw onto a specific "
+            "existing slide.").pack(anchor="w")
 
         # Buttons
         btns = ttk.Frame(outer)
-        btns.grid(row=1, column=0, sticky="ew", pady=(10, 6))
-        ttk.Button(btns, text="Slide Content to notes",
-                   command=self.on_extract).pack(side="left", padx=(0, 6))
-        ttk.Button(btns, text="Reformat slide",
-                   command=self.on_reformat).pack(side="left")
-        ttk.Button(btns, text="Insert into PowerPoint",
-                   style="Accent.TButton",
-                   command=self.on_insert).pack(side="right")
+        btns.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 6))
+        reformat_btn = ttk.Button(btns, text="Reformat slide (beta)",
+                                  command=self.on_reformat)
+        reformat_btn.pack(side="left")
+        _tip(reformat_btn,
+            "BETA — repositions the boxes already on the active slide to "
+            "match the settings on the right (spacing, boxes-per-row, "
+            "layout). Does NOT change the wording already in the boxes. "
+            "This feature is still rough and may not do what you expect — "
+            "save your presentation before using it.")
+        insert_btn = ttk.Button(btns, text="Insert into PowerPoint",
+                                style="Accent.TButton",
+                                command=self.on_insert)
+        insert_btn.pack(side="right")
+        _tip(insert_btn,
+            "Draws a new snake diagram from the items above, using the "
+            "settings on the right.")
 
         # Status log
         logf = ttk.Labelframe(outer, text="Status", padding=6)
-        logf.grid(row=2, column=0, sticky="nsew")
+        logf.grid(row=3, column=0, columnspan=2, sticky="nsew")
         self.log_txt = tk.Text(logf, height=6, wrap="word")
         self.log_txt.pack(fill="both", expand=True)
         self.log_txt.configure(state="disabled")
 
         outer.columnconfigure(0, weight=1)
-        self._log("Ready. Type items in slide notes, then Insert.")
+        outer.columnconfigure(1, weight=0)
+        outer.rowconfigure(1, weight=1)
+        outer.rowconfigure(3, weight=1)
+        self._log("Ready. Type your items on the left, then click "
+                  "\"Insert into PowerPoint\". See \"How to use\" above for "
+                  "the full walkthrough.")
 
     # ---- helpers ----
     def _log(self, msg):
@@ -653,6 +789,14 @@ class SnakeApp:
         self.log_txt.see("end")
         self.log_txt.configure(state="disabled")
 
+    def _items(self):
+        text = self.items_txt.get("1.0", "end-1c")
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    def _set_items(self, items):
+        self.items_txt.delete("1.0", "end")
+        self.items_txt.insert("1.0", "\n".join(items))
+
     def _cfg(self):
         cfg = dict(DEFAULTS)
         cfg.update(
@@ -660,6 +804,8 @@ class SnakeApp:
             layout=self.layout_var.get(),
             gap_y=max(0.1, self.gapy_var.get()),
             gap_x=max(0.05, self.gapx_var.get()),
+            box_w=max(0.3, self.boxw_var.get()),
+            box_h=max(0.2, self.boxh_var.get()),
             number_items=self.num_var.get(),
             title=self.title_var.get().strip(),
         )
@@ -667,15 +813,73 @@ class SnakeApp:
 
     # ---- actions ----
     def on_insert(self):
+        items = self._items()
+        if not items:
+            self._log("Type at least one item on the left (one per line), "
+                      "or click \"Load from slide notes/content\" first.")
+            return
         try:
             app = get_powerpoint()
-            items = read_items_from_active(app)
+            new_slide = self.target_var.get() == "new"
+            _, n = draw_snake(app, items, self._cfg(), new_slide=new_slide)
+            where = "a new slide" if new_slide else "the active slide"
+            self._log(f"Inserted {n} boxes ({self.layout_var.get()} layout) "
+                      f"on {where}.")
+        except pythoncom.com_error as exc:
+            self._log(f"PowerPoint error: {exc}")
+            messagebox.showerror("PowerPoint error", str(exc))
+        except Exception as exc:                                # noqa: BLE001
+            self._log(f"Error: {exc}")
+            messagebox.showerror("Error", str(exc))
+
+    def on_load_notes(self):
+        """Pull the item list typed in the active slide's Notes pane into
+        the items box for editing."""
+        try:
+            app = get_powerpoint()
+            slide = app.ActiveWindow.View.Slide
+            title = _get_slide_title(slide)
+            if title:
+                self.title_var.set(title)
+            lines = _notes_textframe(slide).TextRange.Text.splitlines()
+            items = [_strip_number(ln) for ln in lines if ln.strip()]
             if not items:
-                self._log("No items found in the notes of the active slide.")
+                self._log("The active slide's notes are empty — type your "
+                          "list on the left, then click Insert.")
                 return
-            _, n = draw_snake(app, items, self._cfg(),
-                              new_slide=(self.target_var.get() == "new"))
-            self._log(f"Inserted {n} boxes ({self.layout_var.get()} layout).")
+            self._set_items(items)
+            self._log(f"Loaded {len(items)} items from the slide's notes. "
+                      "Edit them on the left, then click Insert or "
+                      "Reformat slide.")
+        except pythoncom.com_error as exc:
+            self._log(f"PowerPoint error: {exc}")
+            messagebox.showerror("PowerPoint error", str(exc))
+        except Exception as exc:                                # noqa: BLE001
+            self._log(f"Error: {exc}")
+            messagebox.showerror("Error", str(exc))
+
+    def on_load_shapes(self):
+        """Pull the text already on the active slide's boxes/shapes (ignoring
+        notes) into the items box for editing."""
+        try:
+            app = get_powerpoint()
+            slide = app.ActiveWindow.View.Slide
+            title = _get_slide_title(slide)
+            if title:
+                self.title_var.set(title)
+            boxes = [s for s in slide.Shapes if s.Name.startswith("box_")]
+            if boxes:
+                boxes.sort(key=lambda s: int(s.Name.split("_")[1]))
+                items = [_strip_number(s.TextFrame.TextRange.Text) for s in boxes]
+            else:
+                items = _read_autoboxes_ordered(slide)
+            if not items:
+                self._log("No shapes with text found on the active slide.")
+                return
+            self._set_items(items)
+            self._log(f"Loaded {len(items)} items from the slide's shapes. "
+                      "Edit them on the left, then click Insert or "
+                      "Reformat slide.")
         except pythoncom.com_error as exc:
             self._log(f"PowerPoint error: {exc}")
             messagebox.showerror("PowerPoint error", str(exc))
@@ -686,8 +890,8 @@ class SnakeApp:
     def on_extract(self):
         """Read every AutoShape with text from the active slide in positional
         reading order, write the numbered list to the slide notes, and load
-        the items into the text box.  After this, use 'Reformat slide' to
-        redraw everything cleanly using the current settings."""
+        the items into the box on the left.  After this, use 'Reformat
+        slide' to redraw everything cleanly using the current settings."""
         try:
             app = get_powerpoint()
             slide = app.ActiveWindow.View.Slide
@@ -702,9 +906,9 @@ class SnakeApp:
                 _notes_textframe(slide), shapes, items,
                 [s.TextFrame.TextRange.Text.strip() for s in shapes],
             )
-            self._log(
-                f"Extracted {len(items)} items from slide shapes → notes updated.")
-            self._log("Edit notes in PowerPoint, then click 'Reformat slide'.")
+            self._set_items(items)
+            self._log(f"Synced {len(items)} items from the slide's boxes. "
+                      "Edit them on the left, then click \"Reformat slide\".")
         except pythoncom.com_error as exc:
             self._log(f"PowerPoint error: {exc}")
             messagebox.showerror("PowerPoint error", str(exc))
@@ -714,17 +918,26 @@ class SnakeApp:
 
     def on_reformat(self):
         """Move existing boxes to new positions and redraw connectors."""
+        items = self._items()
+        if not items:
+            self._log("Type at least one item on the left (one per line), "
+                      "or click \"Load from slide notes/content\" first.")
+            return
+        proceed = messagebox.askyesno(
+            "Reformat slide (beta)",
+            "Reformat slide is still beta and may not do what you expect.\n\n"
+            "Save your presentation before continuing, in case you need to "
+            "undo the result.\n\nContinue anyway?",
+            default="no",
+        )
+        if not proceed:
+            self._log("Reformat cancelled.")
+            return
         try:
             app = get_powerpoint()
-            slide = app.ActiveWindow.View.Slide
-
-            items = read_items_from_active(app)
-            if not items:
-                self._log("No items found on the active slide to reformat.")
-                return
-
             _, n = reformat_in_place(app, items, self._cfg())
-            self._log(f"Reformatted slide: {n} boxes repositioned ({self.layout_var.get()} layout).")
+            self._log(f"Reformatted slide: {n} boxes repositioned "
+                      f"({self.layout_var.get()} layout).")
         except pythoncom.com_error as exc:
             self._log(f"PowerPoint error: {exc}")
             messagebox.showerror("PowerPoint error", str(exc))
