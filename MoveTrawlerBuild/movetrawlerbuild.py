@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 movetrawlerbuild.py
-Finds the most recently modified build folder in C:\\MonarchDevBuild\\dist and
-moves it whole to the correct Trawler destination:
+Runs the Trawler build script, then finds the resulting build folder in
+C:\\MonarchDevBuild\\dist and copies it whole to the correct destination:
   - contains "experimental" (case-insensitive) -> S:\\AOA Team\\Trawler\\Experimental Builds
   - otherwise                                  -> S:\\AOA Team\\Trawler
 """
@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+BUILD_BAT = r"C:\Users\jake.mann\Documents\Trawler\builder\builds\build.bat"
 SRC_DIR = r"C:\MonarchDevBuild\dist"
 DEST_NORMAL = r"S:\AOA Team\Trawler"
 DEST_EXPERIMENTAL = r"S:\AOA Team\Trawler\Experimental Builds"
@@ -70,88 +72,123 @@ def destination_for(folder_path: str) -> str:
     return DEST_NORMAL
 
 
+def run_build() -> str:
+    """Runs build.bat to completion. Returns an error message, or "" on success."""
+    if not os.path.isfile(BUILD_BAT):
+        return f"Build script not found: {BUILD_BAT}"
+    try:
+        result = subprocess.run(
+            ["cmd", "/c", BUILD_BAT],
+            cwd=os.path.dirname(BUILD_BAT),
+            input="\n",  # answers the bat's trailing `pause` so it can't hang
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception as exc:
+        return str(exc)
+    if result.returncode != 0:
+        tail = ((result.stdout or "") + (result.stderr or ""))[-1000:]
+        return f"Build failed (exit {result.returncode}):\n{tail}"
+    return ""
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.busy = False
-        self.latest_folder = find_latest_folder(SRC_DIR)
 
         scale = dpi_scale(root)
         root.tk.call("tk", "scaling", scale * (96 / 72))
 
         root.title("Move Trawler Build")
-        root.geometry(f"{int(420 * scale)}x{int(220 * scale)}")
+        root.geometry(f"{int(420 * scale)}x{int(200 * scale)}")
         root.resizable(False, False)
 
         main = ttk.Frame(root, padding=14)
         main.pack(fill="both", expand=True)
 
-        ttk.Label(main, text="Latest build folder:").pack(anchor="w")
-        self.folder_label = ttk.Label(
-            main,
-            text=os.path.basename(self.latest_folder) if self.latest_folder else "(none found)",
-            font=("Segoe UI", 10, "bold"),
-            wraplength=390,
-        )
-        self.folder_label.pack(anchor="w", pady=(0, 10))
-
-        ttk.Label(main, text="Destination:").pack(anchor="w")
-        dest = destination_for(self.latest_folder) if self.latest_folder else "-"
-        self.dest_label = ttk.Label(main, text=dest, wraplength=390)
-        self.dest_label.pack(anchor="w", pady=(0, 12))
-
         ttk.Label(
             main,
-            text="Yes = move this folder to the destination above",
+            text="Builds the latest Trawler EXE, then copies the new build folder to the Trawler share.",
             wraplength=390,
             justify="left",
         ).pack(anchor="w", pady=(0, 12))
 
-        buttons = ttk.Frame(main)
-        buttons.pack(fill="x")
+        self.progress = ttk.Progressbar(main, mode="indeterminate")
+        self.progress.pack(fill="x", pady=(0, 12))
 
-        self.yes_btn = ttk.Button(buttons, text="Yes", command=self.start_move)
-        self.yes_btn.pack(side="left")
-        ttk.Button(buttons, text="No", command=root.destroy).pack(side="left", padx=(8, 0))
+        self.go_btn = ttk.Button(main, text="Build & Copy", command=self.start)
+        self.go_btn.pack(anchor="w")
 
-        self.status = ttk.Label(main, text="", anchor="w")
+        self.status = ttk.Label(main, text="", anchor="w", wraplength=390)
         self.status.pack(fill="x", pady=(10, 0))
 
-        if not self.latest_folder:
-            self.set_status(f"No folders found in {SRC_DIR}", error=True)
-            self.yes_btn.state(["disabled"])
+        if not os.path.isfile(BUILD_BAT):
+            self.set_status(f"Build script not found: {BUILD_BAT}", error=True)
+            self.go_btn.state(["disabled"])
 
     def set_status(self, text: str, error: bool = False) -> None:
         self.status.config(text=text, foreground="#c0392b" if error else "#333")
 
-    def start_move(self) -> None:
-        if self.busy or not self.latest_folder:
+    def start(self) -> None:
+        if self.busy:
             return
         self.busy = True
-        self.yes_btn.state(["disabled"])
-        self.set_status("Moving...")
-        threading.Thread(target=self._move_worker, args=(self.latest_folder,), daemon=True).start()
+        self.go_btn.state(["disabled"])
+        self.progress.start(12)
+        self.set_status("Building...")
+        threading.Thread(target=self._worker, daemon=True).start()
 
-    def _move_worker(self, folder: str) -> None:
+    def _worker(self) -> None:
+        build_error = run_build()
+        if build_error:
+            self.root.after(0, self._done, None, None, build_error)
+            return
+
+        self.root.after(0, self.set_status, "Build finished, copying...")
+
+        folder = find_latest_folder(SRC_DIR)
+        if not folder:
+            self.root.after(0, self._done, None, None, f"No folders found in {SRC_DIR} after build.")
+            return
+
         dest_dir = destination_for(folder)
+        dest_path = os.path.join(dest_dir, os.path.basename(folder))
         error = ""
         try:
             os.makedirs(dest_dir, exist_ok=True)
-            shutil.move(folder, dest_dir)
+            if os.path.exists(dest_path):
+                shutil.rmtree(dest_path)
+            shutil.copytree(folder, dest_path)
+
+            # The exe is the whole point of the copy - antivirus/network
+            # hiccups can silently drop it, so confirm one landed. The exe
+            # name drops any "-branch-EXPERIMENTAL" suffix from the folder
+            # name, so just look for any .exe directly inside instead of an
+            # exact name match.
+            has_exe = any(name.lower().endswith(".exe") for name in os.listdir(dest_path))
+            if not has_exe:
+                error = (
+                    "Copy finished but no .exe was found in the destination "
+                    "folder (antivirus may have quarantined it)."
+                )
         except Exception as exc:
             error = str(exc)
+
         self.root.after(0, self._done, folder, dest_dir, error)
 
-    def _done(self, folder: str, dest_dir: str, error: str) -> None:
+    def _done(self, folder: str | None, dest_dir: str | None, error: str) -> None:
         self.busy = False
-        self.yes_btn.state(["!disabled"])
+        self.go_btn.state(["!disabled"])
+        self.progress.stop()
 
         if error:
-            messagebox.showerror("Move failed", error)
-            self.set_status("Move failed.", error=True)
+            messagebox.showerror("Failed", error)
+            self.set_status("Failed.", error=True)
             return
 
-        self.set_status(f"Moved {os.path.basename(folder)} to {dest_dir}")
+        self.set_status(f"Copied {os.path.basename(folder)} to {dest_dir}")
 
 
 def main() -> int:
