@@ -18,9 +18,24 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 BUILD_BAT = r"C:\Users\jake.mann\Documents\Trawler\builder\builds\build.bat"
+REPO_DIR = r"C:\Users\jake.mann\Documents\Trawler"
 SRC_DIR = r"C:\MonarchDevBuild\dist"
 DEST_NORMAL = r"S:\AOA Team\Trawler"
 DEST_EXPERIMENTAL = r"S:\AOA Team\Trawler\Experimental Builds"
+
+
+def current_branch() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", REPO_DIR, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        branch = result.stdout.strip()
+        return branch if result.returncode == 0 and branch else "(unknown)"
+    except Exception:
+        return "(unknown)"
 
 
 def apply_dpi_awareness() -> None:
@@ -108,6 +123,9 @@ class App:
         main = ttk.Frame(root, padding=14)
         main.pack(fill="both", expand=True)
 
+        self.branch_label = ttk.Label(main, text=f"Branch: {current_branch()}", font=("Segoe UI", 9, "bold"))
+        self.branch_label.pack(anchor="w", pady=(0, 8))
+
         ttk.Label(
             main,
             text="Builds the latest Trawler EXE, then copies the new build folder to the Trawler share.",
@@ -136,6 +154,7 @@ class App:
             return
         self.busy = True
         self.go_btn.state(["disabled"])
+        self.branch_label.config(text=f"Branch: {current_branch()}")
         self.progress.start(12)
         self.set_status("Building...")
         threading.Thread(target=self._worker, daemon=True).start()
@@ -156,6 +175,7 @@ class App:
         dest_dir = destination_for(folder)
         dest_path = os.path.join(dest_dir, os.path.basename(folder))
         error = ""
+        exe_names: list[str] = []
         try:
             os.makedirs(dest_dir, exist_ok=True)
             if os.path.exists(dest_path):
@@ -167,8 +187,8 @@ class App:
             # name drops any "-branch-EXPERIMENTAL" suffix from the folder
             # name, so just look for any .exe directly inside instead of an
             # exact name match.
-            has_exe = any(name.lower().endswith(".exe") for name in os.listdir(dest_path))
-            if not has_exe:
+            exe_names = [name for name in os.listdir(dest_path) if name.lower().endswith(".exe")]
+            if not exe_names:
                 error = (
                     "Copy finished but no .exe was found in the destination "
                     "folder (antivirus may have quarantined it)."
@@ -176,9 +196,10 @@ class App:
         except Exception as exc:
             error = str(exc)
 
-        self.root.after(0, self._done, folder, dest_dir, error)
+        exe_name = exe_names[0] if not error and exe_names else None
+        self.root.after(0, self._done, dest_dir, exe_name, error)
 
-    def _done(self, folder: str | None, dest_dir: str | None, error: str) -> None:
+    def _done(self, dest_dir: str | None, exe_name: str | None, error: str) -> None:
         self.busy = False
         self.go_btn.state(["!disabled"])
         self.progress.stop()
@@ -188,7 +209,7 @@ class App:
             self.set_status("Failed.", error=True)
             return
 
-        self.set_status(f"Copied {os.path.basename(folder)} to {dest_dir}")
+        self.set_status(f"Done: {exe_name} -> {dest_dir}")
 
 
 def main() -> int:
