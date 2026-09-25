@@ -152,9 +152,20 @@ class App:
     def start(self) -> None:
         if self.busy:
             return
+
+        branch = current_branch()
+        self.branch_label.config(text=f"Branch: {branch}")
+
+        if branch.lower() == "main":
+            proceed = messagebox.askyesno(
+                "Confirm official build",
+                "You're on main - this will send a build to the official Trawler folder. Continue?",
+            )
+            if not proceed:
+                return
+
         self.busy = True
         self.go_btn.state(["disabled"])
-        self.branch_label.config(text=f"Branch: {current_branch()}")
         self.progress.start(12)
         self.set_status("Building...")
         threading.Thread(target=self._worker, daemon=True).start()
