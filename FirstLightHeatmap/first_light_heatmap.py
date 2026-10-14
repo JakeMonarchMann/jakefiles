@@ -4,7 +4,8 @@ Usage:
     python first_light_heatmap.py [data.csv] [--out-dir DIR] [--y-bin-um 1] [--z-bin-um 1]
                                   [--half-window-mm 0.5] [--scale shared|panel] [--log]
 
-With no CSV argument a file picker opens. Outputs go next to the CSV unless --out-dir is given.
+With no CSV argument a file picker opens. Outputs go in a heatmaps folder next to the CSV
+unless --out-dir is given, in which case that folder is used.
 Safe on empty, header-only, partially written, or unfinished CSVs.
 """
 import argparse
@@ -351,7 +352,7 @@ def main(argv=None):
     if path is None or not path.is_file():
         print(f"No CSV found: {path}")
         return 1
-    out_dir = Path(a.out_dir) if a.out_dir else (Path(OUT_DIR) if OUT_DIR else path.parent)
+    out_dir = Path(a.out_dir) if a.out_dir else (Path(OUT_DIR) if OUT_DIR else path.parent / "heatmaps")
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = path.stem
 
@@ -438,10 +439,8 @@ def main(argv=None):
         print("WARNING: no positive voltages; log scale unavailable, using linear.")
     glob_norm = make_norm(vmin, vmax, a.log, pos_min)
 
-    heatmap_dir = out_dir / "heatmaps"
-    heatmap_dir.mkdir(exist_ok=True)
-    paths = plot_individual(results, heatmap_dir, stem, glob_norm, a.scale, a.log)
-    paths.append(plot_summary(results, heatmap_dir, stem, glob_norm, a.scale, a.log))
+    paths = plot_individual(results, out_dir, stem, glob_norm, a.scale, a.log)
+    paths.append(plot_summary(results, out_dir, stem, glob_norm, a.scale, a.log))
     paths.append(plot_peak_vs_x(results, out_dir, stem))
 
     table = pd.DataFrame([{
