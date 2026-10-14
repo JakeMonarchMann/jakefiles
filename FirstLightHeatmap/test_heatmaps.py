@@ -119,6 +119,54 @@ class SingleSweepTests(unittest.TestCase):
         self.assertEqual(len(sweep), 4)
         self.assertEqual(counts["dropped: blank V/Y/Z/X"], 1)
 
+    def test_rectangular_outputs_shrink_without_clipping_labels(self):
+        sweep, nominal = single.select_sweep(sample_frame())
+        original_save = single.plt.Figure.savefig
+        with tempfile.TemporaryDirectory() as folder:
+            for ratio in [0.2, 0.7, 1.0, 2.0, 5.0]:
+                with self.subTest(ratio=ratio):
+                    res = single.analyze_sweep(sweep, .001, .001)
+                    res["yhi"] = res["ylo"] + ratio
+                    res["zhi"] = res["zlo"] + 1.0
+
+                    def capture(fig, path, *args, **kwargs):
+                        width, height = fig.get_size_inches()
+                        self.assertLess(width, 9)
+                        self.assertLessEqual(height, 8)
+                        if ratio > 1:
+                            self.assertLess(height, 8)
+                        self.assertEqual(kwargs["bbox_inches"], "tight")
+                        self.assertGreaterEqual(kwargs["pad_inches"], 0.2)
+                        fig.canvas.draw()
+                        renderer = fig.canvas.get_renderer()
+                        bounds = fig.get_tightbbox(renderer).transformed(fig.dpi_scale_trans)
+                        for ax in fig.axes:
+                            xlo, xhi = sorted(ax.get_xlim())
+                            ylo, yhi = sorted(ax.get_ylim())
+                            xticks = [label for pos, label in zip(ax.get_xticks(), ax.get_xticklabels())
+                                      if xlo <= pos <= xhi]
+                            yticks = [label for pos, label in zip(ax.get_yticks(), ax.get_yticklabels())
+                                      if ylo <= pos <= yhi]
+                            for text in [ax.title, ax.xaxis.label, ax.yaxis.label,
+                                         *xticks, *yticks]:
+                                if text.get_visible() and text.get_text():
+                                    box = text.get_window_extent(renderer)
+                                    self.assertGreaterEqual(box.x0, bounds.x0 - 1)
+                                    self.assertGreaterEqual(box.y0, bounds.y0 - 1)
+                                    self.assertLessEqual(box.x1, bounds.x1 + 1)
+                                    self.assertLessEqual(box.y1, bounds.y1 + 1)
+                        plot_box = fig.axes[0].get_window_extent(renderer)
+                        self.assertAlmostEqual(plot_box.width / plot_box.height, ratio)
+                        return original_save(fig, path, *args, **kwargs)
+
+                    with patch.object(single.plt.Figure, "savefig", capture):
+                        single.save_heatmap(
+                            res, Path(folder) / f"ratio_{ratio}.png",
+                            single.sweep_title(res, nominal),
+                            single.make_norm(res["vmin"], res["vmax"], False, res["pos_min"]),
+                            False,
+                        )
+
 
 class MultiSweepTests(unittest.TestCase):
     def test_revisits_combine_and_transient_stage_positions_are_excluded(self):

@@ -11,6 +11,8 @@ All HEXAPOD MOVEINC sweeps at one stage X are combined, including later sweeps
 and spirals. Revisits retain the highest voltage per bin. Multiple stage X
 values (rounded to 1 um) require multi_x_heatmaps.py instead.
 Axes use measured scan bounds (unfinished scans show only the area measured).
+Individual PNG dimensions follow the scan proportions, with padded tight
+cropping to preserve titles, axis labels, and the colorbar.
 The title reports PACKAGE X/Y and HEXSTAGE X/Y/Z from the last settled,
 fully populated row before the first hexapod move, plus the nominal hexapod
 pose. These are recorded readbacks, not inferred coordinate transformations.
@@ -246,7 +248,11 @@ def draw_heatmap(ax, res, norm, log, small=False):
 
 def save_heatmap(res: dict, path: Path, title: str, norm, log: bool) -> Path:
     """Save one heatmap, for either the standalone CLI or a multi-scan slice."""
-    fig, ax = plt.subplots(figsize=(9, 8), constrained_layout=True)
+    ratio = (res["yhi"] - res["ylo"]) / (res["zhi"] - res["zlo"])
+    plot_width = max(2.0, 6.0 * min(ratio, 1.0))
+    plot_height = max(2.0, 6.0 / max(ratio, 1.0))
+    fig, ax = plt.subplots(figsize=(plot_width + 2.0, plot_height + 2.0),
+                           constrained_layout=True)
     try:
         im = draw_heatmap(ax, res, norm, log)
         ax.set_title(title, fontsize=10)
@@ -254,7 +260,7 @@ def save_heatmap(res: dict, path: Path, title: str, norm, log: bool) -> Path:
         ax.set_ylabel("Hexapod Z (mm)")
         fig.colorbar(im, ax=ax, label=f"max scope voltage per bin ({V_UNIT})"
                      + (" - log" if log else ""))
-        fig.savefig(path, dpi=130)
+        fig.savefig(path, dpi=130, bbox_inches="tight", pad_inches=0.2)
     finally:
         plt.close(fig)
     return path
