@@ -10,6 +10,7 @@ C:\\MonarchDevBuild\\dist and copies it whole to the correct destination:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,98 @@ REPO_DIR = r"C:\Users\jake.mann\Documents\Trawler"
 SRC_DIR = r"C:\MonarchDevBuild\dist"
 DEST_NORMAL = r"S:\AOA Team\Trawler"
 DEST_EXPERIMENTAL = r"S:\AOA Team\Trawler\Experimental Builds"
+
+TITLE_PATTERN = re.compile(r'\.title\([^)]*v(\d+)\.(\d+)\.(\d+)')
+_MAX_BRANCH_CHARS = 20
+
+
+def _folder_safe(s: str) -> str:
+    s = re.sub(r'[<>:"/\\|?*]', " ", s)
+    return re.sub(r"\s+", ".", s.strip())
+
+
+def detect_expected_version() -> str | None:
+    entry = os.path.join(REPO_DIR, "Trawler.pyw")
+    if os.path.isfile(entry):
+        try:
+            with open(entry, "r", encoding="utf-8", errors="ignore") as f:
+                m = TITLE_PATTERN.search(f.read())
+            if m:
+                return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+        except Exception:
+            pass
+
+    app_py = os.path.join(REPO_DIR, "trawler", "app.py")
+    if os.path.isfile(app_py):
+        try:
+            with open(app_py, "r", encoding="utf-8", errors="ignore") as f:
+                m = TITLE_PATTERN.search(f.read())
+            if m:
+                return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+        except Exception:
+            pass
+
+    skip_dirs = {".git", ".venv", "builder", "__pycache__", "bench_tests"}
+    hits: list[tuple[str, str]] = []
+    for root, dirs, files in os.walk(REPO_DIR):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+        for file in files:
+            if file.endswith(".py"):
+                path = os.path.join(root, file)
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        m = TITLE_PATTERN.search(f.read())
+                    if m:
+                        hits.append((path, f"{m.group(1)}.{m.group(2)}.{m.group(3)}"))
+                except Exception:
+                    pass
+    if hits:
+        hits.sort(key=lambda x: x[0])
+        return hits[0][1]
+
+    return None
+
+
+def detect_expected_suffix(branch: str) -> str:
+    if not branch or branch == "main" or branch == "(unknown)":
+        return ""
+    branch_safe = (_folder_safe(branch) or "branch")[:_MAX_BRANCH_CHARS]
+    return f"-{branch_safe}-EXPERIMENTAL"
+
+
+def get_expected_folder_name() -> str | None:
+    builder_py = os.path.join(REPO_DIR, "builder", "builds", "build_exe.py")
+    if os.path.isfile(builder_py):
+        try:
+            builder_dir = os.path.dirname(builder_py)
+            if builder_dir not in sys.path:
+                sys.path.insert(0, builder_dir)
+            import importlib
+
+            build_exe = importlib.import_module("build_exe")
+
+            build_exe._source_cache = None
+            app_name = build_exe.detect_app_name()
+            entries = build_exe.detect_entry_scripts()
+            multi = len(entries) > 1
+            versions = {e: build_exe.detect_version(e) for e in entries}
+            exp_suffix = build_exe.detect_experimental_suffix()
+            e = entries[0]
+            basename = (
+                f"{app_name} - {e.stem} v{versions[e]}"
+                if multi
+                else f"{app_name} v{versions[e]}"
+            ) + exp_suffix
+            return basename
+        except Exception:
+            pass
+
+    version = detect_expected_version()
+    if not version:
+        return None
+    branch = current_branch()
+    suffix = detect_expected_suffix(branch)
+    return f"Trawler v{version}{suffix}"
 
 
 def current_branch() -> str:
@@ -155,6 +248,19 @@ class App:
 
         branch = current_branch()
         self.branch_label.config(text=f"Branch: {branch}")
+
+        expected_folder = get_expected_folder_name()
+        if expected_folder:
+            dest_dir = destination_for(expected_folder)
+            dest_path = os.path.join(dest_dir, expected_folder)
+            if os.path.exists(dest_path):
+                messagebox.showerror(
+                    "Version Already Built",
+                    f"You already built this version ({expected_folder}).\n\n"
+                    f"Destination folder already exists:\n{dest_path}",
+                )
+                self.set_status(f"Build cancelled: {expected_folder} already exists at destination.", error=True)
+                return
 
         if branch.lower() == "main":
             proceed = messagebox.askyesno(
