@@ -230,7 +230,7 @@ def draw_heatmap(ax, res, norm, log, small=False):
 def pass_title(res, small=False):
     tag = "" if res["complete"] else f"  PARTIAL/INCOMPLETE ({res['z_rows_filled']}/{res['z_rows_expected']} Z rows)"
     head = f"X {res['offset']:+d} \u00b5m" + (f" (#{res['dup']})" if res["dup"] > 1 else "") + tag
-    body = f"peak {res['peak_v']:.4g} {V_UNIT}  Y {res['peak_y']:+.4f}  Z {res['peak_z']:+.4f} mm"
+    body = f"best {res['peak_v']:.4g} {V_UNIT} at Y {res['peak_y']:+.4f} mm, Z {res['peak_z']:+.4f} mm"
     return head + "\n" + body
 
 
