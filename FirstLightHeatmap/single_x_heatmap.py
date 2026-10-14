@@ -7,8 +7,14 @@ Usage:
 With no CSV argument, a file picker opens. Outputs default to a heatmaps folder
 next to the CSV: one PNG and one peak-results CSV.
 
-All HEXAPOD MOVEINC sweeps at one stage X are combined, including later sweeps
-and spirals. Revisits retain the highest voltage per bin. Multiple stage X
+All positioned readings from the first sweep until the first recorded RBA motion
+are combined, including MOVEUNTIL spirals, dwells, and pre-RBA optimization.
+The matching run .txt recipe resolves which optimizer moves Aligner1/Aligner2;
+activation, tool setup, and axis configuration do not count as motion.
+Stationary optimizer calibration is retained. Motion is a joint change greater
+than 0.001 degree from the median of the last 25 complete pre-command samples.
+The moving sample and everything afterward are excluded. Joint readbacks are
+required if an RBA-motion command occurs. Revisits retain the highest voltage per bin. Multiple stage X
 values (rounded to 1 um) require multi_x_heatmaps.py instead.
 Axes use measured scan bounds (unfinished scans show only the area measured).
 Individual PNG dimensions follow the scan proportions, with padded tight
@@ -23,6 +29,7 @@ for the multi-scan multi_x_heatmaps.py entry point.
 
 import argparse
 import io
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -55,6 +62,9 @@ HEXAPOD_COLS = ["hex_X_mm", COL_Y, COL_Z]
 NOMINAL_COLS = PACKAGE_COLS + HEXSTAGE_COLS + HEXAPOD_COLS
 BASE_USECOLS = NUMERIC + [COL_CMD] + HEXSTAGE_COLS[1:]
 USECOLS = list(dict.fromkeys(BASE_USECOLS + NOMINAL_COLS))
+ALIGNER_JOINT_COLS = [f"meca_Aligner{arm}_J{joint}_deg"
+                      for arm in (1, 2) for joint in range(1, 7)]
+RBA_MOTION_TOL_DEG = 0.001
 
 
 def load_csv(path: Path, columns: list[str] = USECOLS) -> tuple[pd.DataFrame, int]:
@@ -68,13 +78,83 @@ def load_csv(path: Path, columns: list[str] = USECOLS) -> tuple[pd.DataFrame, in
     if missing:
         raise ValueError(f"CSV is missing required columns: {missing}")
     buf.seek(0)
-    df = pd.read_csv(buf, usecols=columns, dtype=str, on_bad_lines="warn",
+    read_columns = list(columns)
+    if "script_line" in header and "script_line" not in read_columns:
+        read_columns.append("script_line")
+    read_columns.extend(col for col in ALIGNER_JOINT_COLS
+                        if col in header and col not in read_columns)
+    df = pd.read_csv(buf, usecols=read_columns, dtype=str, on_bad_lines="warn",
                      encoding_errors="replace")
-    for col in columns:
+    for col in read_columns:
         if col != COL_CMD:
             df[col] = pd.to_numeric(df[col], errors="coerce")
             df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+    recipe = path.with_name(path.name.replace("_data_", "_")).with_suffix(".txt")
+    if recipe.is_file():
+        df.attrs["recipe_lines"] = recipe.read_text(encoding="utf-8-sig").splitlines()
     return df, len(data) - cut - 1
+
+
+def rba_command_start(df: pd.DataFrame) -> int:
+    """Return the first commanded RBA-motion row, resolving optimizer axes."""
+    motion = r"(?:ALIGNER[12]\s+(?:MOVE\w*|GOTOMAX)\b|(?:TANDEM|OPPOSITE)\s+MOVE\w*\b)"
+    cmd = df[COL_CMD].fillna("").str.split("//").str[0].str.strip().str.upper()
+    cutoff = cmd.str.match(motion).to_numpy()
+    recipe_lines = df.attrs.get("recipe_lines")
+    optimizers = cmd.str.match(r"OPTIMIZE2?\s+(?:MAXIMIZE|MINIMIZE)\b")
+    if optimizers.any():
+        if recipe_lines is None or "script_line" not in df:
+            raise ValueError("Optimizer readings require the matching run .txt recipe and "
+                             "CSV script_line to identify RBA motion safely.")
+        rba_lines = set()
+        axes = set()
+        for number, text in enumerate(recipe_lines, 1):
+            code = text.split("//", 1)[0].strip().upper()
+            axis = re.match(r"OPTIMIZE\s+AXIS\s+(\w+)", code)
+            if axis:
+                axes.add(axis.group(1))
+            if re.match(r"OPTIMIZE2?\s+(?:MAXIMIZE|MINIMIZE)\b", code):
+                if not axes:
+                    raise ValueError(f"Cannot identify optimizer axes at recipe line {number}.")
+                if any(axis.startswith(("TANDEM_", "OPPOSITE_", "ALIGNER1_", "ALIGNER2_"))
+                       for axis in axes):
+                    rba_lines.add(number)
+                axes.clear()
+            elif re.match(motion, code):
+                rba_lines.add(number)
+        source_lines = pd.to_numeric(df["script_line"], errors="coerce")
+        for number in source_lines[optimizers].unique():
+            if not np.isfinite(number) or number != int(number) or not 1 <= number <= len(recipe_lines):
+                raise ValueError(f"Invalid optimizer script_line: {number}")
+            if not re.match(r"OPTIMIZE2?\s+(?:MAXIMIZE|MINIMIZE)\b",
+                            recipe_lines[int(number) - 1].strip().upper()):
+                raise ValueError(f"CSV optimizer does not match recipe line {int(number)}.")
+        cutoff |= source_lines.isin(rba_lines).to_numpy()
+    hits = np.flatnonzero(cutoff)
+    return int(hits[0]) if hits.size else len(df)
+
+
+def rba_motion_cutoff(df: pd.DataFrame) -> int:
+    """Retain stationary calibration, stopping at the first detected joint motion."""
+    start = rba_command_start(df)
+    if start == len(df):
+        return len(df)
+    missing = [col for col in ALIGNER_JOINT_COLS if col not in df]
+    if missing:
+        raise ValueError(f"RBA motion detection requires joint readbacks: {missing}")
+    joints = df[ALIGNER_JOINT_COLS].apply(pd.to_numeric, errors="coerce")
+    joints = joints.replace([np.inf, -np.inf], np.nan)
+    before = joints.iloc[:start].dropna().tail(25)
+    if before.empty:
+        raise ValueError("No complete pre-command Aligner joint samples to establish a baseline.")
+    after = joints.iloc[start:]
+    if after.isna().any(axis=None):
+        raise ValueError("Incomplete Aligner joint readbacks after the RBA command; "
+                         "cannot determine the first movement safely.")
+    baseline = before.median()
+    moving = (after - baseline).abs().gt(RBA_MOTION_TOL_DEG).any(axis=1).to_numpy()
+    hits = np.flatnonzero(moving)
+    return start + int(hits[0]) if hits.size else len(df)
 
 
 def starting_stage_title(df: pd.DataFrame) -> str:
@@ -91,14 +171,25 @@ def starting_stage_title(df: pd.DataFrame) -> str:
     return f"Starting HEXSTAGE: {positions} mm"
 
 
-def filter_snake(df: pd.DataFrame, require_moving: bool = False):
-    """Keep all hexapod incremental sweeps; report discarded rows explicitly."""
+def filter_snake(df: pd.DataFrame, require_moving: bool = False,
+                 include_all_readings: bool = False):
+    """Keep sweep data before RBA motion; optionally keep every positioned reading."""
     df = df.copy()
     counts = {"rows read": len(df)}
+    cutoff = rba_motion_cutoff(df)
+    counts["dropped: RBA motion and all later rows"] = len(df) - cutoff
+    if cutoff < len(df):
+        row = df.iloc[cutoff]
+        print(f"RBA cutoff at {row[COL_T]:g} s: {row[COL_CMD]}")
+    df = df.iloc[:cutoff]
     for col in NUMERIC:
         df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
     up = df[COL_CMD].fillna("").str.strip().str.upper()
     is_snake = up.str.match(r"HEXAPOD\s+MOVEINC\b")
+    if include_all_readings:
+        starts = np.flatnonzero(up.str.match(r"HEXAPOD\s+(?:MOVEINC|MOVEUNTIL)\b").to_numpy())
+        if starts.size:
+            is_snake = pd.Series(np.arange(len(df)) >= starts[0], index=df.index)
     breakdown = {}
     non = up[~is_snake]
     assigned = pd.Series(False, index=non.index)
@@ -110,7 +201,7 @@ def filter_snake(df: pd.DataFrame, require_moving: bool = False):
     breakdown["script_cmd blank"] = int(blank.sum())
     assigned |= blank
     breakdown["other script_cmd (DWELL, variable lines, ...)"] = int((~assigned).sum())
-    counts["dropped: not a snake (MOVEINC) row"] = int((~is_snake).sum())
+    counts["dropped: outside selected scan readings"] = int((~is_snake).sum())
     snake = df[is_snake]
     counts["snake rows"] = len(snake)
     for col in [COL_V, COL_Y, COL_Z, COL_X]:
@@ -146,8 +237,8 @@ def select_sweep(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
         raise ValueError("No settled nominal stage/hexapod readbacks before the first move.")
     nominal = nominal_rows.iloc[-1]
 
-    sweep, counts, breakdown = filter_snake(df)
-    print("\n== Row filters (all sweeps) ==")
+    sweep, counts, breakdown = filter_snake(df, include_all_readings=True)
+    print("\n== Row filters (all pre-RBA scan readings) ==")
     for label, count in counts.items():
         print(f"  {label}: {count}")
     for label, count in breakdown.items():
@@ -276,7 +367,7 @@ def sweep_title(res: dict, nominal: pd.Series) -> str:
         return ", ".join(f"{axis} {nominal[col]:+.4f}" for axis, col in zip("XYZ", cols))
 
     return (
-        "First light - Y/Z sweeps at one stage X\n"
+        "First light - pre-RBA readings at one stage X\n"
         f"Nominal PACKAGE (hexapod centered): {positions(PACKAGE_COLS)} mm\n"
         f"Nominal HEXSTAGE: {positions(HEXSTAGE_COLS)} mm\n"
         f"Reference hexapod: {positions(HEXAPOD_COLS)} mm\n"
@@ -339,6 +430,7 @@ def main(argv=None) -> int:
             "peak_Y_mm": res["peak_y"], "peak_Z_mm": res["peak_z"],
             "y_min_mm": res["y_min"], "y_max_mm": res["y_max"],
             "z_min_mm": res["z_min"], "z_max_mm": res["z_max"],
+            "t_start_s": res["t0"], "t_end_s": res["t1"],
         }
         record.update({f"nominal_{col}": nominal[col] for col in NOMINAL_COLS})
         pd.DataFrame([record]).to_csv(csv_out, index=False)

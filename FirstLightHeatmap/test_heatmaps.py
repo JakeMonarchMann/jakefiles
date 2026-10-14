@@ -35,7 +35,7 @@ def sample_frame() -> pd.DataFrame:
 class SingleSweepTests(unittest.TestCase):
     def test_selection_excludes_corner_but_includes_later_sweeps(self):
         sweep, nominal = single.select_sweep(sample_frame())
-        self.assertEqual(len(sweep), 5)
+        self.assertEqual(len(sweep), 6)
         self.assertEqual(nominal["hex_Y_mm"], 0)
         self.assertEqual(nominal["hex_Z_mm"], 0)
         self.assertEqual(sweep["oscope_voltage_V"].max(), .005)
@@ -58,7 +58,7 @@ class SingleSweepTests(unittest.TestCase):
         self.assertEqual(res["grid"][0, 0], 4)
         self.assertEqual(res["grid"][300, 1], 5)
         self.assertTrue(np.isnan(res["grid"][1, 0]))
-        self.assertEqual(res["vmin"], 4)
+        self.assertEqual(res["vmin"], 0)
         self.assertEqual(res["pos_min"], 4)
 
     def test_single_point_has_nonzero_axis_limits(self):
@@ -92,7 +92,7 @@ class SingleSweepTests(unittest.TestCase):
             out_dir = Path(folder) / "heatmaps"
             self.assertGreater((out_dir / "scan_single_sweep_heatmap.png").stat().st_size, 1000)
             results = pd.read_csv(out_dir / "scan_single_sweep_results.csv")
-            self.assertEqual(results.loc[0, "rows_used"], 5)
+            self.assertEqual(results.loc[0, "rows_used"], 6)
             self.assertAlmostEqual(results.loc[0, "peak_V"], .005)
             self.assertAlmostEqual(results.loc[0, "nominal_shrc_pkg_X_mm"], -93.696)
 
@@ -118,6 +118,84 @@ class SingleSweepTests(unittest.TestCase):
         sweep, counts, _ = single.filter_snake(df)
         self.assertEqual(len(sweep), 4)
         self.assertEqual(counts["dropped: blank V/Y/Z/X"], 1)
+
+    def test_spiral_and_calibration_stop_at_first_pair_movement(self):
+        df = sample_frame()
+        df.loc[1, single.COL_CMD] = "Aligner1 SET TOOL RBA"
+        df.loc[2, single.COL_CMD] = "Aligner2 ActivateRobot()"
+        df.loc[4, single.COL_CMD] = "HEXAPOD MOVEUNTIL Z+(LegLen) VOLTAGE > Target"
+        df.loc[5, single.COL_CMD] = "DWELL 200"
+        df.loc[6, single.COL_CMD] = "OPTIMIZE MAXIMIZE OSCOPE_VOLTAGE"
+        df.loc[7, single.COL_CMD] = "OPTIMIZE2 MAXIMIZE OSCOPE_VOLTAGE"
+        df.loc[8, single.COL_CMD] = "OPTIMIZE MAXIMIZE OSCOPE_VOLTAGE"
+        df["script_line"] = [1, 2, 3, 4, 5, 6, 8, 10, 12]
+        df.attrs["recipe_lines"] = [
+            "DWELL 200", "Aligner1 SET TOOL RBA", "Aligner2 ActivateRobot()",
+            "HEXAPOD MOVEINC Z(.1)", "HEXAPOD MOVEUNTIL Z+(.01) VOLTAGE > Target",
+            "DWELL 200", "OPTIMIZE AXIS HEXAPOD_Y STEP .001 MAX .01",
+            "OPTIMIZE MAXIMIZE OSCOPE_VOLTAGE",
+            "OPTIMIZE AXIS TANDEM_YAW STEP .5 MAX 5",
+            "OPTIMIZE2 MAXIMIZE OSCOPE_VOLTAGE",
+            "OPTIMIZE AXIS HEXAPOD_Y STEP .001 MAX .01",
+            "OPTIMIZE MAXIMIZE OSCOPE_VOLTAGE",
+        ]
+        for col in single.ALIGNER_JOINT_COLS:
+            df[col] = 0.0
+        df.loc[8, single.ALIGNER_JOINT_COLS[0]] = .002
+        sweep, _ = single.select_sweep(df)
+        self.assertEqual(sweep[single.COL_T].tolist(), [3, 4, 5, 6, 7])
+        self.assertEqual(single.rba_motion_cutoff(df), 8)
+        self.assertEqual(sweep[single.COL_V].max(), .004)
+
+    def test_direct_rba_motion_is_cutoff_not_activation_or_tool_setup(self):
+        df = sample_frame()
+        df.loc[1, single.COL_CMD] = "Aligner1 SET TOOL RBA"
+        df.loc[2, single.COL_CMD] = "Aligner2 ActivateRobot()"
+        df.loc[7, single.COL_CMD] = "Aligner1 MovePose(1,2,3,4,5,6)"
+        for col in single.ALIGNER_JOINT_COLS:
+            df[col] = 0.0
+        df.loc[7, single.ALIGNER_JOINT_COLS[-1]] = .002
+        sweep, _ = single.select_sweep(df)
+        self.assertEqual(sweep[single.COL_T].tolist(), [3, 4, 5, 6])
+
+    def test_command_without_movement_keeps_later_readings_and_ignores_jitter(self):
+        df = sample_frame()
+        df.loc[7, single.COL_CMD] = "Aligner2 MovePose(1,2,3,4,5,6)"
+        for col in single.ALIGNER_JOINT_COLS:
+            df[col] = 0.0
+        df.loc[7:, single.ALIGNER_JOINT_COLS[-1]] = .0008
+        self.assertEqual(single.rba_motion_cutoff(df), len(df))
+        sweep, _ = single.select_sweep(df)
+        self.assertEqual(sweep[single.COL_T].max(), 8)
+
+    def test_missing_joint_readbacks_fail_explicitly_when_motion_command_occurs(self):
+        df = sample_frame()
+        df.loc[7, single.COL_CMD] = "Aligner1 MovePose(1,2,3,4,5,6)"
+        with self.assertRaisesRegex(ValueError, "requires joint readbacks"):
+            single.rba_motion_cutoff(df)
+        for col in single.ALIGNER_JOINT_COLS:
+            df[col] = 0.0
+        df.loc[8, single.ALIGNER_JOINT_COLS[0]] = np.nan
+        with self.assertRaisesRegex(ValueError, "Incomplete Aligner"):
+            single.rba_motion_cutoff(df)
+
+    def test_unresolved_optimizer_fails_instead_of_including_rba_data(self):
+        df = sample_frame()
+        df.loc[7, single.COL_CMD] = "OPTIMIZE2 MAXIMIZE OSCOPE_VOLTAGE"
+        with self.assertRaisesRegex(ValueError, "matching run .txt recipe"):
+            single.select_sweep(df)
+
+    def test_loader_finds_recipe_and_preserves_source_line_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "run_data_20261014.csv"
+            recipe = Path(folder) / "run_20261014.txt"
+            recipe.write_text("Aligner1 MovePose(1,2,3,4,5,6)\n", encoding="utf-8")
+            df = sample_frame()
+            df["script_line"] = 1
+            df.to_csv(path, index=False)
+            loaded, _ = single.load_csv(path)
+            self.assertEqual(loaded.attrs["recipe_lines"], [recipe.read_text().strip()])
+            self.assertEqual(loaded["script_line"].iloc[0], 1)
 
     def test_rectangular_outputs_shrink_without_clipping_labels(self):
         sweep, nominal = single.select_sweep(sample_frame())
@@ -182,7 +260,7 @@ class MultiSweepTests(unittest.TestCase):
         sweep, _ = single.select_sweep(sample_frame())
         runs, transient = multi.split_passes(sweep)
         self.assertEqual(len(runs), 1)
-        self.assertEqual(len(runs[0][0]), 5)
+        self.assertEqual(len(runs[0][0]), 6)
         self.assertEqual(transient, [])
 
     def test_shared_binning_preserves_expected_window_and_incomplete_status(self):

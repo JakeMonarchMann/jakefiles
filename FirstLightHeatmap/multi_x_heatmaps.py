@@ -12,6 +12,10 @@ fully populated stage sample at or before the first MOVEINC scan row.
 All sweeps revisiting the same rounded (1 um) stage X are combined.
 Single-slice binning and plotting are provided by single_x_heatmap.py.
 With only one X slice, axes use measured bounds rather than an assumed window.
+The matching run .txt recipe identifies RBA optimizer commands. Readings at or
+after the first detected Aligner1/Aligner2 joint movement are excluded, retaining
+stationary optimizer calibration; a lone X slice
+includes all positioned pre-RBA readings, including MOVEUNTIL spirals.
 """
 import argparse
 import sys
@@ -250,7 +254,11 @@ def main(argv=None):
         return 1
     print(stage_title)
 
-    snake, counts, breakdown = filter_snake(df, require_moving=REQUIRE_MOVING)
+    try:
+        snake, counts, breakdown = filter_snake(df, require_moving=REQUIRE_MOVING)
+    except ValueError as e:
+        print(f"Nothing to plot: {e}")
+        return 1
     print("\n== Row filters ==")
     for k, v in counts.items():
         print(f"  {k:<62}{v:>10}")
@@ -279,7 +287,10 @@ def main(argv=None):
         span_y, span_z = pass_span(snake, first_pass)
         print(f"\nSearch window from first completed pass: Y {span_y:.3f} mm x Z {span_z:.3f} mm")
     else:
-        print("\nOnly one stage X; combining all sweeps using measured bounds (--half-window-mm unused).")
+        snake, _, _ = filter_snake(df, require_moving=REQUIRE_MOVING, include_all_readings=True)
+        runs, _ = split_passes(snake)
+        print("\nOnly one stage X; combining all pre-RBA readings using measured bounds "
+              "(--half-window-mm unused).")
 
     base = runs[0][1]
     results = []
