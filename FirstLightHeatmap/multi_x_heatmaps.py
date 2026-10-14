@@ -1,135 +1,71 @@
-"""First-light heatmaps from a Trawler data CSV: one Y/Z heatmap per HEXSTAGE X pass.
+"""First-light heatmaps from a Trawler data CSV: one Y/Z heatmap per HEXSTAGE X.
 
 Usage:
-    python first_light_heatmap.py [data.csv] [--out-dir DIR] [--y-bin-um 1] [--z-bin-um 1]
+    python multi_x_heatmaps.py [data.csv] [--out-dir DIR] [--y-bin-um 1] [--z-bin-um 1]
                                   [--half-window-mm 0.5] [--scale shared|panel] [--log]
 
 With no CSV argument a file picker opens. Outputs go in a heatmaps folder next to the CSV
 unless --out-dir is given, in which case that folder is used.
 Safe on empty, header-only, partially written, or unfinished CSVs.
+All graph titles include starting HEXSTAGE X/Y/Z readbacks from the first
+fully populated stage sample at or before the first MOVEINC scan row.
+All sweeps revisiting the same rounded (1 um) stage X are combined.
+Single-slice binning and plotting are provided by single_x_heatmap.py.
+With only one X slice, axes use measured bounds rather than an assumed window.
 """
 import argparse
-import io
 import sys
-import warnings
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.cm import ScalarMappable
-from matplotlib.colors import LogNorm, Normalize
+
+import single_x_heatmap as single
+from single_x_heatmap import (
+    BASE_USECOLS as USECOLS, CMAP, COL_CMD, COL_X,
+    COL_Y, COL_Z, SNAKE_TOKEN, V_SCALE, V_UNIT, draw_heatmap, filter_snake,
+    make_norm, plt, starting_stage_title,
+)
 
 # ---------------------------------------------------------------- parameters
 CSV_PATH = None                 # set a path here to skip the file picker / CLI argument
 OUT_DIR = None                  # None = next to the CSV
 Y_BIN_UM = 1.0                  # heatmap bin size in hexapod Y (um)
 Z_BIN_UM = 1.0                  # heatmap bin size in hexapod Z (um)
-HALF_WINDOW_MM = 0.5            # fallback window half-size (mm), used only until a second X pass shows the real one
+HALF_WINDOW_MM = 0.5            # retained CLI default; a lone X slice now uses measured bounds
 SCALE = "shared"                # "shared" = one color scale for all passes, "panel" = per-panel scale
 LOG_SCALE = False               # log color scale (signal may be ~1 mV or less)
 EXPECTED_OFFSETS_UM = [-30, -24, -18, -12, -6, 0, 6, 12, 18, 24, 30]   # X offsets the script should visit
 SHOW_MISSING_EXPECTED = True    # leave an empty "not scanned" panel for expected offsets with no data
-SNAKE_TOKEN = "MOVEINC"         # script_cmd text that marks snake rows
 REQUIRE_MOVING = False          # True = also drop snake rows where hex_moving == 0
-MIN_PASS_ROWS = 25              # an X run shorter than this (rows, 25 Hz) is treated as a transient
+MIN_PASS_ROWS = 25              # an X needs one run this long to be stable; short revisits are kept
 COMPLETE_TOL_UM = 3.0           # pass is complete if Z reached the top of the window within this (um)
 EXTEND_TOL_MM = 0.005           # data outside the window by more than this extends the axes (mm)
-DISPLAY_MAX_PX = 500            # heatmaps are max-pooled to at most this many pixels per side for display
 SUMMARY_COLS = 3
-CMAP = "viridis"
-V_UNIT, V_SCALE = "mV", 1e3     # display unit for voltage
-
-COL_T, COL_CMD, COL_MOV = "time_elapsed_s", "script_cmd", "hex_moving"
-COL_X, COL_Y, COL_Z, COL_V = "shrc_hex_X_mm", "hex_Y_mm", "hex_Z_mm", "oscope_voltage_V"
-NUMERIC = [COL_T, COL_MOV, COL_X, COL_Y, COL_Z, COL_V]
-USECOLS = NUMERIC + [COL_CMD]
-DROP_CATEGORIES = ["MOVEABS", "GOTOMAX", "MOVEUNTIL"]
-
-
-# ------------------------------------------------------------------- loading
-def load_csv(path: Path):
-    """Return (df, info). df is None when there is nothing usable."""
-    data = path.read_bytes()
-    cut = data.rfind(b"\n")
-    if cut == -1:
-        return None, {"reason": "no complete line in file (empty or header still being written)"}
-    tail_bytes = len(data) - (cut + 1)  # bytes of an unterminated last line, dropped
-    buf = io.BytesIO(data[: cut + 1])
-    header = pd.read_csv(buf, nrows=0, encoding_errors="replace").columns
-    missing = [c for c in USECOLS if c not in header]
-    if missing:
-        return None, {"reason": f"missing columns {missing}; file has {len(header)} columns, "
-                                f"e.g. {list(header[:12])}"}
-    buf.seek(0)
-    df = pd.read_csv(buf, usecols=USECOLS, dtype=str, on_bad_lines="skip", encoding_errors="replace")
-    return df, {"tail_bytes": tail_bytes}
-
-
-def filter_snake(df: pd.DataFrame):
-    """Apply the row filters in order; return (snake_df, counts, drop_breakdown)."""
-    counts = {"rows read": len(df)}
-    for c in NUMERIC:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    cmd = df[COL_CMD].fillna("").str.strip()
-    up = cmd.str.upper()
-    is_snake = up.str.contains(SNAKE_TOKEN, regex=False)
-
-    breakdown = {}
-    non = up[~is_snake]
-    assigned = pd.Series(False, index=non.index)
-    for cat in DROP_CATEGORIES:
-        hit = non.str.contains(cat, regex=False) & ~assigned
-        breakdown[f"script_cmd has {cat}"] = int(hit.sum())
-        assigned |= hit
-    blank = (non == "") & ~assigned
-    breakdown["script_cmd blank"] = int(blank.sum())
-    assigned |= blank
-    breakdown["other script_cmd (DWELL, variable lines, ...)"] = int((~assigned).sum())
-    counts["dropped: not a snake (MOVEINC) row"] = int((~is_snake).sum())
-
-    snake = df[is_snake]
-    counts["snake rows"] = len(snake)
-    for c, label in [(COL_V, "oscope_voltage_V"), (COL_Y, "hex_Y_mm"), (COL_Z, "hex_Z_mm"),
-                     (COL_X, "shrc_hex_X_mm")]:
-        counts[f"  of which blank {label}"] = int(snake[c].isna().sum())
-    valid = snake[[COL_V, COL_Y, COL_Z, COL_X]].notna().all(axis=1)
-    counts["dropped: blank V/Y/Z/X"] = int((~valid).sum())
-    snake = snake[valid]
-    counts["snake rows with hex_moving == 0 (kept unless REQUIRE_MOVING)"] = int((snake[COL_MOV] == 0).sum())
-    if REQUIRE_MOVING:
-        keep = snake[COL_MOV].fillna(0) != 0
-        counts["dropped: hex_moving == 0"] = int((~keep).sum())
-        snake = snake[keep]
-
-    t = snake[COL_T].to_numpy()
-    tt = t[~np.isnan(t)]
-    if len(tt) > 1 and (np.diff(tt) < 0).any():
-        print("WARNING: time_elapsed_s is not monotonic; sorting snake rows by time.")
-        snake = snake.sort_values(COL_T, kind="mergesort")
-    return snake.reset_index(drop=True), counts, breakdown
 
 
 # ------------------------------------------------------------------- passes
 def split_passes(snake: pd.DataFrame):
-    """Group snake rows into X passes by rounded (1 um) stage X, in time order."""
+    """Combine all stable sweeps at each rounded (1 um) stage X, in first-visit order."""
     x_um = np.rint(snake[COL_X].to_numpy() * 1000).astype(np.int64)
+    if not x_um.size:
+        return [], []
+    if np.unique(x_um).size == 1:
+        return [(np.arange(len(x_um)), int(x_um[0]))], []
     brk = np.flatnonzero(np.diff(x_um) != 0) + 1
     starts = np.r_[0, brk]
     ends = np.r_[brk, len(x_um)]
-    kept, transient = [], []
+    runs = []
     for s, e in zip(starts, ends):
-        (kept if e - s >= MIN_PASS_ROWS else transient).append((np.arange(s, e), int(x_um[s])))
-    merged = []
-    for idx, x in kept:
-        if merged and merged[-1][1] == x:  # same X resumed after a transient blip
-            merged[-1] = (np.concatenate([merged[-1][0], idx]), x)
-        else:
-            merged.append((idx, x))
-    return merged, transient
+        runs.append((np.arange(s, e), int(x_um[s])))
+    stable_x = {x for idx, x in runs if len(idx) >= MIN_PASS_ROWS}
+    transient = [(idx, x) for idx, x in runs if x not in stable_x]
+    grouped = {}
+    for idx, x in runs:
+        if x in stable_x:
+            grouped.setdefault(x, []).append(idx)
+    return [(np.concatenate(indices), x) for x, indices in grouped.items()], transient
 
 
 def pass_span(snake, idx):
@@ -140,7 +76,7 @@ def pass_span(snake, idx):
 
 def analyze_pass(snake, idx, x_um, span_y, span_z, ybin_mm, zbin_mm, followed):
     sub = snake.iloc[idx]
-    y, z, v = sub[COL_Y].to_numpy(), sub[COL_Z].to_numpy(), sub[COL_V].to_numpy() * V_SCALE
+    y, z = sub[COL_Y].to_numpy(), sub[COL_Z].to_numpy()
     # The snake starts at the window's (Ymin, Zmin) corner, so the first row anchors the window.
     ylo, zlo = y[0], z[0]
     yhi, zhi = ylo + span_y, zlo + span_z
@@ -152,86 +88,30 @@ def analyze_pass(snake, idx, x_um, span_y, span_z, ybin_mm, zbin_mm, followed):
         warn.append(f"Z data [{z.min():.4f}, {z.max():.4f}] outside window [{zlo:.4f}, {zhi:.4f}]; axes extended")
         zlo, zhi = min(zlo, z.min()), max(zhi, z.max())
 
-    ny = int(round((yhi - ylo) / ybin_mm)) + 1
-    nz = int(round((zhi - zlo) / zbin_mm)) + 1
-    iy = np.clip(np.rint((y - ylo) / ybin_mm).astype(np.int64), 0, ny - 1)
-    iz = np.clip(np.rint((z - zlo) / zbin_mm).astype(np.int64), 0, nz - 1)
-    cell = pd.Series(v).groupby(iz * ny + iy).max()
-    grid = np.full((nz, ny), np.nan)
-    grid.flat[cell.index.to_numpy()] = cell.to_numpy()
-
-    k = int(np.argmax(v))
-    dy = np.abs(np.diff(y))
-    dy = dy[(dy > 1e-6) & (dy < 0.05)]
-    pos = grid[grid > 0]
-    return {
-        "x_um": x_um, "rows": len(sub), "grid": grid, "ylo": ylo, "yhi": yhi, "zlo": zlo, "zhi": zhi,
-        "ybin": ybin_mm, "zbin": zbin_mm, "ny": ny, "nz": nz,
-        "peak_v": float(v[k]), "peak_y": float(y[k]), "peak_z": float(z[k]),
-        "y_min": float(y.min()), "y_max": float(y.max()), "z_min": float(z.min()), "z_max": float(z.max()),
-        "t0": float(sub[COL_T].iloc[0]), "t1": float(sub[COL_T].iloc[-1]),
-        "x_mm": float(sub[COL_X].median()),
-        "z_rows_filled": int(np.unique(iz).size), "z_rows_expected": int(round(span_z / zbin_mm)) + 1,
+    res = single.analyze_sweep(sub, ybin_mm, zbin_mm, bounds=(ylo, yhi, zlo, zhi))
+    res.update({
+        "x_um": x_um, "z_rows_expected": int(round(span_z / zbin_mm)) + 1,
         # A pass the stage moved on from is finished; only the last pass can be cut short.
         "complete": bool(followed or z.max() - z[0] >= span_z - COMPLETE_TOL_UM / 1000.0),
-        "vmin": float(np.nanmin(grid)), "vmax": float(np.nanmax(grid)),
-        "pos_min": float(pos.min()) if pos.size else np.nan,
-        "y_step_um": float(np.median(dy) * 1000) if dy.size else np.nan,
         "warn": warn,
-    }
+    })
+    return res
 
 
 # -------------------------------------------------------------------- plotting
-def max_pool(grid, max_px):
-    """Shrink for display while keeping the max of each block, so single hot bins survive."""
-    nz, ny = grid.shape
-    fz, fy = -(-nz // max_px), -(-ny // max_px)
-    if fz == 1 and fy == 1:
-        return grid, 1, 1
-    pz, py = -(-nz // fz) * fz, -(-ny // fy) * fy
-    padded = np.full((pz, py), np.nan)
-    padded[:nz, :ny] = grid
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        out = np.nanmax(padded.reshape(pz // fz, fz, py // fy, fy), axis=(1, 3))
-    return out, fz, fy
-
-
-def make_norm(vmin, vmax, log, pos_min):
-    if log and np.isfinite(pos_min):
-        vmin = pos_min
-    if not vmax > vmin:
-        vmax = vmin + abs(vmin) * 1e-3 + 1e-9
-    return LogNorm(vmin=vmin, vmax=vmax) if log and np.isfinite(pos_min) else Normalize(vmin=vmin, vmax=vmax)
-
-
 def pass_norm(res, glob_norm, scale, log):
     if scale == "panel":
         return make_norm(res["vmin"], res["vmax"], log, res["pos_min"])
     return glob_norm
 
 
-def draw_heatmap(ax, res, norm, log, small=False):
-    grid = np.where(res["grid"] > 0, res["grid"], np.nan) if log else res["grid"]
-    pooled, fz, fy = max_pool(grid, DISPLAY_MAX_PX)
-    cmap = plt.get_cmap(CMAP).copy()
-    cmap.set_bad("white")
-    x0 = res["ylo"] - res["ybin"] / 2
-    z0 = res["zlo"] - res["zbin"] / 2
-    ext = [x0, x0 + pooled.shape[1] * fy * res["ybin"], z0, z0 + pooled.shape[0] * fz * res["zbin"]]
-    im = ax.imshow(pooled, origin="lower", extent=ext, aspect="equal", cmap=cmap, norm=norm,
-                   interpolation="nearest")
-    ax.set_xlim(res["ylo"], res["yhi"])
-    ax.set_ylim(res["zlo"], res["zhi"])
-    ax.scatter([res["peak_y"]], [res["peak_z"]], marker="*", s=90 if small else 160, c="red",
-               edgecolors="white", linewidths=0.8, zorder=5)
-    return im
-
-
 def pass_title(res, small=False):
-    tag = "" if res["complete"] else f"  PARTIAL/INCOMPLETE ({res['z_rows_filled']}/{res['z_rows_expected']} Z rows)"
+    if res["complete"] is None:
+        tag = "  completion unknown (measured bounds)"
+    else:
+        tag = "" if res["complete"] else f"  PARTIAL/INCOMPLETE ({res['z_rows_filled']}/{res['z_rows_expected']} Z rows)"
     head = f"X {res['offset']:+d} \u00b5m" + (f" (#{res['dup']})" if res["dup"] > 1 else "") + tag
-    body = f"best {res['peak_v']:.4g} {V_UNIT} at Y {res['peak_y']:+.4f} mm, Z {res['peak_z']:+.4f} mm"
+    body = single.peak_title(res)
     return head + "\n" + body
 
 
@@ -244,16 +124,8 @@ def plot_individual(results, out_dir, stem, glob_norm, scale, log):
     paths = []
     for res in results:
         norm = pass_norm(res, glob_norm, scale, log)
-        fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
-        im = draw_heatmap(ax, res, norm, log)
-        ax.set_title(pass_title(res), fontsize=10)
-        ax.set_xlabel("Hexapod Y (mm)")
-        ax.set_ylabel("Hexapod Z (mm)")
-        fig.colorbar(im, ax=ax, label=f"max scope voltage per bin ({V_UNIT})")
         p = out_dir / stem_for(res, stem)
-        fig.savefig(p, dpi=130)
-        plt.close(fig)
-        paths.append(p)
+        paths.append(single.save_heatmap(res, p, res["stage_title"] + "\n" + pass_title(res), norm, log))
     return paths
 
 
@@ -293,7 +165,8 @@ def plot_summary(results, out_dir, stem, glob_norm, scale, log):
     if scale != "panel" and last_im is not None:
         fig.colorbar(ScalarMappable(norm=glob_norm, cmap=plt.get_cmap(CMAP)), ax=list(flat[:n]),
                      label=f"max scope voltage per bin ({V_UNIT}){' - log' if log else ''}", shrink=0.8)
-    fig.suptitle(f"First light, max voltage per Y/Z bin - {stem}", fontsize=10)
+    fig.suptitle(f"First light, max voltage per Y/Z bin - {stem}\n"
+                 f"{results[0]['stage_title']}", fontsize=10)
     p = out_dir / f"{stem}_heatmap_summary.png"
     fig.savefig(p, dpi=130)
     plt.close(fig)
@@ -313,7 +186,8 @@ def plot_peak_vs_x(results, out_dir, stem):
         ax.set_ylabel(label)
         ax.grid(alpha=0.3)
     axs[-1].set_xlabel("X offset from first pass (\u00b5m)")
-    axs[0].set_title("Peak vs X (hollow marker = partial/incomplete pass)")
+    axs[0].set_title("Peak vs X (hollow marker = partial/incomplete pass)\n"
+                     + results[0]["stage_title"])
     p = out_dir / f"{stem}_peak_vs_X.png"
     fig.savefig(p, dpi=130)
     plt.close(fig)
@@ -341,9 +215,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", nargs="?")
     ap.add_argument("--out-dir")
-    ap.add_argument("--y-bin-um", type=float, default=Y_BIN_UM)
-    ap.add_argument("--z-bin-um", type=float, default=Z_BIN_UM)
-    ap.add_argument("--half-window-mm", type=float, default=HALF_WINDOW_MM)
+    ap.add_argument("--y-bin-um", type=single.positive_float, default=Y_BIN_UM)
+    ap.add_argument("--z-bin-um", type=single.positive_float, default=Z_BIN_UM)
+    ap.add_argument("--half-window-mm", type=single.positive_float, default=HALF_WINDOW_MM,
+                    help="legacy option; lone X slices now use measured bounds")
     ap.add_argument("--scale", choices=["shared", "panel"], default=SCALE)
     ap.add_argument("--log", action="store_true", default=LOG_SCALE)
     a = ap.parse_args(argv)
@@ -358,20 +233,24 @@ def main(argv=None):
 
     print(f"Reading {path}")
     try:
-        df, info = load_csv(path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+        df, tail_bytes = single.load_csv(path, columns=USECOLS)
+    except (OSError, ValueError, pd.errors.ParserError) as e:
         print(f"Could not parse CSV: {e}")
         return 1
-    if df is None:
-        print(f"Nothing to plot: {info['reason']}")
-        return 1
-    if info["tail_bytes"]:
-        print(f"Dropped unterminated last line ({info['tail_bytes']} bytes) - file looks mid-write.")
+    if tail_bytes:
+        print(f"Dropped unterminated last line ({tail_bytes} bytes) - file looks mid-write.")
     if df.empty:
         print("Nothing to plot: CSV has a header but no data rows yet.")
         return 1
 
-    snake, counts, breakdown = filter_snake(df)
+    try:
+        stage_title = starting_stage_title(df)
+    except ValueError as e:
+        print(f"Nothing to plot: {e}")
+        return 1
+    print(stage_title)
+
+    snake, counts, breakdown = filter_snake(df, require_moving=REQUIRE_MOVING)
     print("\n== Row filters ==")
     for k, v in counts.items():
         print(f"  {k:<62}{v:>10}")
@@ -392,32 +271,40 @@ def main(argv=None):
         print("No stable X pass found (every X run was shorter than MIN_PASS_ROWS).")
         return 1
 
-    # Window size comes from the first completed pass (any pass with a later pass after it);
-    # with a single pass there is nothing to measure, so fall back to --half-window-mm.
+    # Preserve expected-window handling for multiple X slices; a lone slice uses measured bounds.
     if len(runs) > 1:
-        span_y, span_z = pass_span(snake, runs[0][0])
+        first_idx = runs[0][0]
+        gaps = np.flatnonzero(np.diff(first_idx) != 1)
+        first_pass = first_idx[:int(gaps[0]) + 1] if gaps.size else first_idx
+        span_y, span_z = pass_span(snake, first_pass)
         print(f"\nSearch window from first completed pass: Y {span_y:.3f} mm x Z {span_z:.3f} mm")
     else:
-        span_y = span_z = round(2 * a.half_window_mm, 3)
-        print(f"\nOnly one pass so far; assuming a {span_y:.3f} mm square window (--half-window-mm).")
+        print("\nOnly one stage X; combining all sweeps using measured bounds (--half-window-mm unused).")
 
     base = runs[0][1]
-    results, seen = [], {}
-    for i, (idx, x_um) in enumerate(runs):
-        res = analyze_pass(snake, idx, x_um, span_y, span_z, a.y_bin_um / 1000, a.z_bin_um / 1000,
-                           followed=i < len(runs) - 1)
+    results = []
+    for idx, x_um in runs:
+        if len(runs) == 1:
+            res = single.analyze_sweep(snake.iloc[idx], a.y_bin_um / 1000, a.z_bin_um / 1000)
+            res.update({"x_um": x_um, "complete": None, "z_rows_expected": res["nz"],
+                        "warn": ["Scan completion unknown: showing all measured sweeps."]})
+        else:
+            res = analyze_pass(snake, idx, x_um, span_y, span_z, a.y_bin_um / 1000, a.z_bin_um / 1000,
+                               followed=idx[-1] < len(snake) - 1)
         res["offset"] = x_um - base
-        seen[res["offset"]] = seen.get(res["offset"], 0) + 1
-        res["dup"] = seen[res["offset"]]
+        res["stage_title"] = stage_title
+        res["dup"] = 1
         results.append(res)
 
     print(f"\n== Passes (first pass X = {runs[0][1] / 1000:.3f} mm is offset 0) ==")
     print(f"  {'offset':>7} {'rows':>7} {'Z rows':>12} {'Y range (mm)':>24} {'Z range (mm)':>24}  status")
     for r in results:
         zr = f"{r['z_rows_filled']}/{r['z_rows_expected']}"
+        status = "completion unknown" if r["complete"] is None else (
+            "complete" if r["complete"] else "PARTIAL/INCOMPLETE")
         print(f"  {r['offset']:>+5d}um {r['rows']:>7} {zr:>12} "
               f"[{r['y_min']:+9.4f},{r['y_max']:+9.4f}] [{r['z_min']:+9.4f},{r['z_max']:+9.4f}]  "
-              f"{'complete' if r['complete'] else 'PARTIAL/INCOMPLETE'}")
+              f"{status}")
         for w in r["warn"]:
             print(f"    WARNING offset {r['offset']:+d}: {w}")
         if r["y_step_um"] > a.y_bin_um * 1.5:
@@ -428,10 +315,6 @@ def main(argv=None):
     print(f"  Offsets expected: {sorted(EXPECTED_OFFSETS_UM)}"
           f"  missing: {[o for o in EXPECTED_OFFSETS_UM if o not in found]}"
           f"  unexpected: {[o for o in found if o not in EXPECTED_OFFSETS_UM]}")
-    dups = sorted(o for o, n in seen.items() if n > 1)
-    if dups:
-        print(f"  NOTE: offsets seen in more than one separate pass: {dups}")
-
     vmin, vmax = min(r["vmin"] for r in results), max(r["vmax"] for r in results)
     pos = [r["pos_min"] for r in results if np.isfinite(r["pos_min"])]
     pos_min = min(pos) if pos else np.nan
