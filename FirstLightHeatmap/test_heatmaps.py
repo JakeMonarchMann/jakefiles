@@ -204,6 +204,7 @@ class SingleSweepTests(unittest.TestCase):
             for ratio in [0.2, 0.7, 1.0, 2.0, 5.0]:
                 with self.subTest(ratio=ratio):
                     res = single.analyze_sweep(sweep, .001, .001)
+                    res.pop("spiral_zoom", None)
                     res["yhi"] = res["ylo"] + ratio
                     res["zhi"] = res["zlo"] + 1.0
 
@@ -244,6 +245,109 @@ class SingleSweepTests(unittest.TestCase):
                             single.make_norm(res["vmin"], res["vmax"], False, res["pos_min"]),
                             False,
                         )
+
+
+class XYZOptimizerTitleTests(unittest.TestCase):
+    def test_xyz_peak_is_separate_from_coarse_and_rba_optimizer_peaks(self):
+        df = sample_frame()
+        df["script_line"] = 1
+        df.loc[3, single.COL_V] = .02
+        df.loc[6:7, single.COL_CMD] = "OPTIMIZE MAXIMIZE OSCOPE_VOLTAGE"
+        df.loc[6:7, "script_line"] = 4
+        df.loc[6, single.COL_V] = .006
+        df.loc[7, single.COL_V] = .008
+        df.loc[7, "hex_X_mm"] = 15.679
+        df.loc[8, single.COL_CMD] = "OPTIMIZE2 MAXIMIZE OSCOPE_VOLTAGE"
+        df.loc[8, "script_line"] = 6
+        df.loc[8, single.COL_V] = .03
+        df.attrs["recipe_lines"] = [
+            "OPTIMIZE AXIS HEXAPOD_X STEP .001 MAX .01",
+            "OPTIMIZE AXIS HEXAPOD_Y STEP .001 MAX .01",
+            "OPTIMIZE AXIS HEXAPOD_Z STEP .001 MAX .01",
+            "OPTIMIZE MAXIMIZE OSCOPE_VOLTAGE",
+            "OPTIMIZE AXIS TANDEM_ROLL STEP .1 MAX 1",
+            "OPTIMIZE2 MAXIMIZE OSCOPE_VOLTAGE",
+        ]
+        peak = single.xyz_optimizer_peak(df)
+        self.assertEqual(peak, {"voltage_V": .008, "X_mm": 15.679,
+                                "Y_mm": -.1, "Z_mm": -.15})
+        res = single.analyze_sweep(df, .001, .001)
+        res["xyz_optimizer_peak"] = peak
+        title = single.sweep_title(res, df.iloc[0])
+        self.assertIn("XYZ OPTIMIZE sampled best 8 mV", title)
+        self.assertIn("X +15.679000, Y -0.100000, Z -0.150000 mm", title)
+
+    def test_no_xyz_optimizer_omits_annotation(self):
+        df = sample_frame()
+        self.assertIsNone(single.xyz_optimizer_peak(df))
+        res = single.analyze_sweep(df, .001, .001)
+        self.assertNotIn("XYZ OPTIMIZE", single.sweep_title(res, df.iloc[0]))
+
+
+class SpiralZoomTests(unittest.TestCase):
+    def test_explicit_spiral_zoom_has_fine_bins_padded_bounds_and_no_optimizer(self):
+        df = sample_frame()
+        df.loc[7, single.COL_Y] = .005
+        df.loc[8, single.COL_Y] = .00505
+        df.loc[7, single.COL_Z] = -.05
+        df.loc[8, single.COL_Z] = -.0501
+        later = df.iloc[-1:].copy()
+        later[single.COL_CMD] = "OPTIMIZE MAXIMIZE OSCOPE_VOLTAGE"
+        later[single.COL_Y] = .02
+        later[single.COL_V] = .1
+        selected = pd.concat([df.iloc[3:], later], ignore_index=True)
+        res = single.analyze_sweep(selected, .001, .001)
+        zoom = res["spiral_zoom"]
+        self.assertEqual(zoom["rows"], 2)
+        self.assertEqual(zoom["peak_v"], 5)
+        self.assertLess(zoom["ybin"], .001)
+        self.assertLess(zoom["zbin"], .001)
+        ylo, yhi, zlo, zhi = zoom["view_bounds"]
+        self.assertLess(ylo, .005)
+        self.assertGreater(yhi, .00505)
+        self.assertLess(zlo, -.0501)
+        self.assertGreater(zhi, -.05)
+        with tempfile.TemporaryDirectory() as folder:
+            original = single.plt.Figure.savefig
+
+            def capture(fig, path, *args, **kwargs):
+                self.assertEqual(len(fig.axes), 3)
+                self.assertIn("Spiral zoom", fig.axes[1].get_title())
+                np.testing.assert_allclose(fig.axes[1].get_xlim(), [ylo, yhi])
+                self.assertIs(fig.axes[0].images[0].norm, fig.axes[1].images[0].norm)
+                self.assertEqual(len(fig.axes[0].patches), 1)
+                self.assertIsNotNone(fig._suptitle)
+                return original(fig, path, *args, **kwargs)
+
+            with patch.object(single.plt.Figure, "savefig", capture):
+                single.save_heatmap(res, Path(folder) / "spiral.png", "Test metadata",
+                                    single.make_norm(res["vmin"], res["vmax"], False,
+                                                     res["pos_min"]), False)
+
+    def test_no_spiral_does_not_add_a_panel(self):
+        res = single.analyze_sweep(sample_frame().iloc[3:6], .001, .001)
+        self.assertNotIn("spiral_zoom", res)
+
+    def test_small_alternating_legs_after_coarse_sweep_detected_from_data(self):
+        df = sample_frame().iloc[[3]].copy()
+        frames = []
+        legs = [
+            ("Z(Travel)", [0, 0], [0, .1]),
+            ("Y(.00005)", [0, .00005], [.05, .05]),
+            ("Z(.00005)", [.00005, .00005], [.05, .05005]),
+            ("Y(-.0001)", [.00005, -.00005], [.05005, .05005]),
+            ("Z(-.0001)", [-.00005, -.00005], [.05005, .04995]),
+        ]
+        for expression, ys, zs in legs:
+            sub = pd.concat([df, df], ignore_index=True)
+            sub[single.COL_CMD] = "HEXAPOD MOVEINC " + expression
+            sub[single.COL_Y] = ys
+            sub[single.COL_Z] = zs
+            frames.append(sub)
+        sweep = pd.concat(frames, ignore_index=True)
+        spiral = single.spiral_readings(sweep)
+        self.assertEqual(len(spiral), 8)
+        self.assertIn("spiral_zoom", single.analyze_sweep(sweep, .001, .001))
 
 
 class MultiSweepTests(unittest.TestCase):

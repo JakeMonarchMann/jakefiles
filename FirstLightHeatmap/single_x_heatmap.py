@@ -19,6 +19,10 @@ values (rounded to 1 um) require multi_x_heatmaps.py instead.
 Axes use measured scan bounds (unfinished scans show only the area measured).
 Individual PNG dimensions follow the scan proportions, with padded tight
 cropping to preserve titles, axis labels, and the colorbar.
+Detected post-sweep spirals add a high-resolution second panel covering the
+spiral's measured Y/Z extent with padding, using the same voltage scale.
+The single-image title also reports the CSV-sampled maximum during the pre-RBA
+hexapod XYZ optimizer and its recorded hexapod X/Y/Z coordinates, when present.
 The title reports PACKAGE X/Y and HEXSTAGE X/Y/Z from the last settled,
 fully populated row before the first hexapod move, plus the nominal hexapod
 pose. These are recorded readbacks, not inferred coordinate transformations.
@@ -41,6 +45,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import LogNorm, Normalize
+from matplotlib.patches import Rectangle
 
 CSV_PATH = None
 OUT_DIR = None
@@ -251,8 +256,62 @@ def select_sweep(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return sweep, nominal
 
 
+def spiral_readings(sweep: pd.DataFrame) -> pd.DataFrame:
+    """Identify post-sweep spiral legs, preferring explicit command names."""
+    if COL_CMD not in sweep:
+        return sweep.iloc[:0]
+    cmd = sweep[COL_CMD].fillna("").str.split("//").str[0].str.strip().str.upper()
+    legs = cmd.str.match(r"HEXAPOD\s+(?:MOVEINC|MOVEUNTIL)\b")
+    explicit = legs & cmd.str.contains(r"LEGLEN|SPIRAL", regex=True)
+    if explicit.any():
+        indices = np.flatnonzero(explicit.to_numpy())
+        return sweep.iloc[indices[0]:indices[-1] + 1]
+
+    # Compare whole command legs, not per-sample spacing: slow coarse sweeps
+    # can have tiny sample spacing too.
+    keys = cmd.copy()
+    if "script_line" in sweep:
+        keys = keys + "|" + sweep["script_line"].astype(str)
+    groups = keys.ne(keys.shift()).cumsum()
+    segments = []
+    for _, sub in sweep.groupby(groups, sort=False):
+        first = int(sweep.index.get_indexer([sub.index[0]])[0])
+        last = first + len(sub)
+        if not legs.iloc[first]:
+            continue
+        dy = float(np.ptp(sub[COL_Y].to_numpy()))
+        dz = float(np.ptp(sub[COL_Z].to_numpy()))
+        axis = COL_Y if dy >= dz else COL_Z
+        travel = max(dy, dz)
+        direction = float(sub[axis].iloc[-1] - sub[axis].iloc[0])
+        segments.append((first, last, travel, axis, direction))
+    if not segments:
+        return sweep.iloc[:0]
+    coarse = max(segment[2] for segment in segments)
+    if coarse <= 0:
+        return sweep.iloc[:0]
+    candidates = []
+    for first, last, travel, axis, direction in segments:
+        if not candidates and not any(seg[0] < first and seg[2] >= coarse * .5
+                                      for seg in segments):
+            continue
+        if 0 < travel < coarse * .1:
+            candidates.append((first, last, axis, direction))
+        elif candidates:
+            candidates = []
+    if len(candidates) < 4:
+        return sweep.iloc[:0]
+    # A snake's tiny row steps alone are not a spiral: both axes must reverse.
+    for axis in (COL_Y, COL_Z):
+        signs = {np.sign(direction) for _, _, name, direction in candidates if name == axis}
+        if not {-1, 1}.issubset(signs):
+            return sweep.iloc[:0]
+    return sweep.iloc[candidates[0][0]:candidates[-1][1]]
+
+
 def analyze_sweep(sweep: pd.DataFrame, ybin_mm: float, zbin_mm: float,
-                  bounds: tuple[float, float, float, float] | None = None) -> dict:
+                  bounds: tuple[float, float, float, float] | None = None,
+                  include_spiral_zoom: bool = True) -> dict:
     """Bin one X slice; multi-scan callers may supply an expected scan window."""
     if sweep.empty:
         raise ValueError("Cannot analyze an empty sweep.")
@@ -281,7 +340,7 @@ def analyze_sweep(sweep: pd.DataFrame, ybin_mm: float, zbin_mm: float,
     positive = grid[grid > 0]
     dy = np.abs(np.diff(y))
     dy = dy[(dy > 1e-6) & (dy < 0.05)]
-    return {
+    result = {
         "grid": grid, "rows": len(sweep), "ylo": ylo, "zlo": zlo,
         "yhi": yhi, "zhi": zhi,
         "ybin": ybin_mm, "zbin": zbin_mm, "ny": ny, "nz": nz,
@@ -295,6 +354,20 @@ def analyze_sweep(sweep: pd.DataFrame, ybin_mm: float, zbin_mm: float,
         "z_rows_filled": int(np.unique(iz).size),
         "y_step_um": float(np.median(dy) * 1000) if dy.size else np.nan,
     }
+    if include_spiral_zoom:
+        spiral = spiral_readings(sweep.reset_index(drop=True))
+        if not spiral.empty:
+            sy = float(np.ptp(spiral[COL_Y].to_numpy()))
+            sz = float(np.ptp(spiral[COL_Z].to_numpy()))
+            zoom_ybin = min(ybin_mm, max(sy / 100, 1e-6))
+            zoom_zbin = min(zbin_mm, max(sz / 100, 1e-6))
+            zoom = analyze_sweep(spiral, zoom_ybin, zoom_zbin, include_spiral_zoom=False)
+            ypad = max(sy * .1, zoom_ybin * 2)
+            zpad = max(sz * .1, zoom_zbin * 2)
+            zoom["view_bounds"] = (zoom["y_min"] - ypad, zoom["y_max"] + ypad,
+                                   zoom["z_min"] - zpad, zoom["z_max"] + zpad)
+            result["spiral_zoom"] = zoom
+    return result
 
 
 def max_pool(grid, max_px):
@@ -342,14 +415,37 @@ def save_heatmap(res: dict, path: Path, title: str, norm, log: bool) -> Path:
     ratio = (res["yhi"] - res["ylo"]) / (res["zhi"] - res["zlo"])
     plot_width = max(2.0, 6.0 * min(ratio, 1.0))
     plot_height = max(2.0, 6.0 / max(ratio, 1.0))
-    fig, ax = plt.subplots(figsize=(plot_width + 2.0, plot_height + 2.0),
-                           constrained_layout=True)
+    zoom = res.get("spiral_zoom")
+    if zoom is None:
+        fig, ax = plt.subplots(figsize=(plot_width + 2.0, plot_height + 2.0),
+                               constrained_layout=True)
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(plot_width + 7.0, plot_height + 2.0),
+                                 constrained_layout=True, gridspec_kw={"width_ratios": [plot_width, 5]})
+        ax = axes[0]
     try:
         im = draw_heatmap(ax, res, norm, log)
-        ax.set_title(title, fontsize=10)
+        if zoom is None:
+            ax.set_title(title, fontsize=10)
+        else:
+            fig.suptitle(title, fontsize=10)
+            ax.set_title("All pre-RBA readings", fontsize=10)
+            zoom_ax = axes[1]
+            draw_heatmap(zoom_ax, zoom, norm, log)
+            ylo, yhi, zlo, zhi = zoom["view_bounds"]
+            zoom_ax.set_xlim(ylo, yhi)
+            zoom_ax.set_ylim(zlo, zhi)
+            zoom_ax.set_title("Spiral zoom (spiral readings only)\n" + peak_title(zoom), fontsize=9)
+            zoom_ax.set_xlabel("Hexapod Y (mm)")
+            zoom_ax.set_ylabel("Hexapod Z (mm)")
+            zoom_ax.ticklabel_format(axis="both", style="plain", useOffset=False)
+            ax.add_patch(Rectangle(
+                (ylo, zlo), yhi - ylo, zhi - zlo, fill=False, edgecolor="red",
+                linewidth=1.0, zorder=6))
         ax.set_xlabel("Hexapod Y (mm)")
         ax.set_ylabel("Hexapod Z (mm)")
-        fig.colorbar(im, ax=ax, label=f"max scope voltage per bin ({V_UNIT})"
+        fig.colorbar(im, ax=ax if zoom is None else list(axes),
+                     label=f"max scope voltage per bin ({V_UNIT})"
                      + (" - log" if log else ""))
         fig.savefig(path, dpi=130, bbox_inches="tight", pad_inches=0.2)
     finally:
@@ -362,17 +458,61 @@ def peak_title(res: dict) -> str:
             f"Y {res['peak_y']:+.4f} mm, Z {res['peak_z']:+.4f} mm")
 
 
+def xyz_optimizer_peak(sweep: pd.DataFrame) -> dict | None:
+    """Find the sampled maximum in a recipe-identified, hexapod-only XYZ optimizer."""
+    cmd = sweep[COL_CMD].fillna("").str.strip().str.upper()
+    optimizers = cmd.str.match(r"OPTIMIZE2?\s+(?:MAXIMIZE|MINIMIZE)\b")
+    if not optimizers.any():
+        return None
+    recipe = sweep.attrs.get("recipe_lines")
+    if recipe is None or "script_line" not in sweep:
+        raise ValueError("XYZ optimizer title requires the matching recipe and script_line.")
+    xyz_lines = set()
+    axes = set()
+    for number, text in enumerate(recipe, 1):
+        code = text.split("//", 1)[0].strip().upper()
+        axis = re.match(r"OPTIMIZE\s+AXIS\s+(\w+)", code)
+        if axis:
+            axes.add(axis.group(1))
+        if re.match(r"OPTIMIZE2?\s+(?:MAXIMIZE|MINIMIZE)\b", code):
+            if code.startswith(("OPTIMIZE MAXIMIZE", "OPTIMIZE2 MAXIMIZE")) and axes == {
+                "HEXAPOD_X", "HEXAPOD_Y", "HEXAPOD_Z"
+            }:
+                xyz_lines.add(number)
+            axes.clear()
+    samples = sweep[optimizers & sweep["script_line"].isin(xyz_lines)]
+    if samples.empty:
+        return None
+    positions = samples[HEXAPOD_COLS + [COL_V]].apply(pd.to_numeric, errors="coerce")
+    valid = np.isfinite(positions.to_numpy()).all(axis=1)
+    if not valid.any():
+        raise ValueError("No complete voltage and hexapod X/Y/Z samples in XYZ optimization.")
+    if not valid.all():
+        print(f"WARNING: excluded {int((~valid).sum())} incomplete XYZ optimizer samples from title.")
+    positions = positions[valid]
+    best = positions.iloc[int(np.argmax(positions[COL_V].to_numpy()))]
+    return {"voltage_V": float(best[COL_V]), "X_mm": float(best[HEXAPOD_COLS[0]]),
+            "Y_mm": float(best[COL_Y]), "Z_mm": float(best[COL_Z])}
+
+
 def sweep_title(res: dict, nominal: pd.Series) -> str:
     def positions(cols: list[str]) -> str:
         return ", ".join(f"{axis} {nominal[col]:+.4f}" for axis, col in zip("XYZ", cols))
 
-    return (
+    title = (
         "First light - pre-RBA readings at one stage X\n"
         f"Nominal PACKAGE (hexapod centered): {positions(PACKAGE_COLS)} mm\n"
         f"Nominal HEXSTAGE: {positions(HEXSTAGE_COLS)} mm\n"
         f"Reference hexapod: {positions(HEXAPOD_COLS)} mm\n"
         + peak_title(res)
     )
+    xyz = res.get("xyz_optimizer_peak")
+    if xyz is not None:
+        title += (
+            f"\nXYZ OPTIMIZE sampled best {xyz['voltage_V'] * V_SCALE:.4g} {V_UNIT}: "
+            f"X {xyz['X_mm']:+.6f}, Y {xyz['Y_mm']:+.6f}, Z {xyz['Z_mm']:+.6f} mm"
+        )
+    return title
 
 
 def positive_float(value: str) -> float:
@@ -415,6 +555,7 @@ def main(argv=None) -> int:
             print(f"Dropped unterminated last line ({tail_bytes} bytes).")
         sweep, nominal = select_sweep(df)
         res = analyze_sweep(sweep, args.y_bin_um / 1000, args.z_bin_um / 1000)
+        res["xyz_optimizer_peak"] = xyz_optimizer_peak(sweep)
         log = args.log and np.isfinite(res["pos_min"])
         if args.log and not log:
             print("WARNING: no positive voltages; using a linear color scale.")
@@ -433,6 +574,9 @@ def main(argv=None) -> int:
             "t_start_s": res["t0"], "t_end_s": res["t1"],
         }
         record.update({f"nominal_{col}": nominal[col] for col in NOMINAL_COLS})
+        if res["xyz_optimizer_peak"] is not None:
+            record.update({f"xyz_optimize_best_{key}": value
+                           for key, value in res["xyz_optimizer_peak"].items()})
         pd.DataFrame([record]).to_csv(csv_out, index=False)
     except (OSError, ValueError, pd.errors.ParserError, ImportError) as exc:
         print(f"Could not produce single-sweep heatmap: {exc}", file=sys.stderr)
