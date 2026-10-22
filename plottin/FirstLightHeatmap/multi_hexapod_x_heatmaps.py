@@ -5,7 +5,7 @@ where the HEXSTAGE stays put and the hexapod itself steps in X between slices. E
 snake raster (HEXAPOD MOVEINC) of hexapod Y/Z, typically over a circle.
 
 Usage:
-    python multi_hexapod_x_heatmaps.py [data.csv] [--out-dir DIR] [--y-bin-um 1] [--z-bin-um 6]
+    python multi_hexapod_x_heatmaps.py [data.csv] [--out-dir DIR] [--y-bin-um N] [--z-bin-um N]
                                        [--scale shared|panel] [--log] [--max-gap-s 1]
                                        [--first-gap-um 24] [--title TEXT]
 
@@ -27,8 +27,9 @@ also labelled with their distance from the aperture: first gap + offset. This as
 +X points away from the aperture, as in the Lens Aperture Raster recipe.
 
 All slices share one Y/Z window taken from the largest slice, so partial slices (a Stopped run
-cuts the last one short) show only the part that was scanned. The Z bin defaults to 6 um
-because the scope samples about every 6 um along a sweep; finer Z bins leave streaks.
+cuts the last one short) show only the part that was scanned. Bin sizes are auto-sized by default:
+the finest, most square Y/Z bins that leave no empty bins inside the scanned area, so the map is
+a solid circle/square. --y-bin-um / --z-bin-um fix either size (the other is still auto-sized).
 Binning and rendering are provided by single_stage_x_heatmap.py. The CSV is read in chunks
 with only the needed columns, so multi-gigabyte files are fine. Safe on empty, header-only,
 partially written, or unfinished CSVs.
@@ -59,8 +60,11 @@ else:
 CSV_PATH = None                 # set a path here to skip the file picker / CLI argument
 OUT_DIR = None                  # None = heatmaps_hexapod_x next to the CSV
 TITLE_PREFIX = "BG-CY0000"       # pre-filled in the title box; type the rest of the unit name after it
-Y_BIN_UM = 1.0             #     # heatmap bin size in hexapod Y (um); raster rows are 1 um apart
-Z_BIN_UM = 6.0                  # heatmap bin size in hexapod Z (um); ~ the sample spacing along a sweep
+Y_BIN_UM = None                 # heatmap bin size in hexapod Y (um); None = auto-size so there are no gaps
+Z_BIN_UM = None                 # heatmap bin size in hexapod Z (um); None = auto-size so there are no gaps
+AUTO_HOLE_TOL = 0.002           # auto bins: accept when at most this fraction of scanned bins is empty
+AUTO_GROWTH = 1.2               # auto bins: candidate sizes grow by this factor per step
+AUTO_STEPS = 22                 # auto bins: candidates from 1 um up (1.2**21 = ~46 um)
 SCALE = "shared"                # "shared" = one color scale for all slices, "panel" = per-panel scale
 LOG_SCALE = False               # log color scale (signal may be ~1 mV or less)
 MAX_GAP_S = 1.0                 # raster rows further apart in time than this start a new slice (s)
@@ -157,6 +161,51 @@ def scan_window(scan: pd.DataFrame, slices):
         if best is None or area > best[0]:
             best = (area, float(y.min()), float(y.max()), float(z.min()), float(z.max()))
     return best[1:]
+
+
+def hole_fraction(y, z, window, ybin_mm, zbin_mm):
+    """Fraction of empty bins inside the scanned footprint (between each Y column's first and last
+    filled Z bin); the ragged outer edge of the scan is not counted as a hole."""
+    ylo, yhi, zlo, zhi = window
+    ny = max(int(round((yhi - ylo) / ybin_mm)) + 1, 1)
+    nz = max(int(round((zhi - zlo) / zbin_mm)) + 1, 1)
+    iy = np.clip(np.rint((y - ylo) / ybin_mm).astype(np.int64), 0, ny - 1)
+    iz = np.clip(np.rint((z - zlo) / zbin_mm).astype(np.int64), 0, nz - 1)
+    filled = np.zeros((nz, ny), bool)
+    filled[iz, iy] = True
+    cols = np.flatnonzero(filled.any(axis=0))
+    if cols.size < 2:
+        return 1.0
+    first = filled.argmax(axis=0)
+    last = nz - 1 - filled[::-1].argmax(axis=0)
+    x = np.arange(cols[0], cols[-1] + 1)
+    lo = np.interp(x, cols, first[cols])
+    hi = np.interp(x, cols, last[cols])
+    zz = np.arange(nz)[:, None]
+    inside = (zz >= np.ceil(lo)) & (zz <= np.floor(hi))
+    block = filled[:, cols[0]:cols[-1] + 1]
+    return float((inside & ~block).sum() / max(inside.sum(), 1))
+
+
+def auto_bins_um(scan, slices, window, y_um=None, z_um=None, tol=AUTO_HOLE_TOL):
+    """Finest, most square Y/Z bin sizes (um) that leave no holes in any slice.
+
+    A size given by the user is kept and only the other axis is searched."""
+    pts = [(scan.iloc[idx][COL_Y].to_numpy(), scan.iloc[idx][COL_Z].to_numpy()) for idx in slices]
+    sizes = [AUTO_GROWTH ** k for k in range(AUTO_STEPS)]
+    y_opts = [y_um] if y_um else sizes
+    z_opts = [z_um] if z_um else sizes
+    combos = sorted(((yb, zb) for yb in y_opts for zb in z_opts), key=lambda c: (max(c), c[0] * c[1]))
+    worst = 1.0
+    for yb, zb in combos:
+        worst = 0.0
+        for y, z in pts:
+            worst = max(worst, hole_fraction(y, z, window, yb / 1000, zb / 1000))
+            if worst > tol:
+                break
+        else:
+            return yb, zb, worst
+    return combos[-1][0], combos[-1][1], worst
 
 
 def analyze_slice(scan, idx, window, ybin_mm, zbin_mm, followed):
@@ -340,8 +389,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", nargs="?")
     ap.add_argument("--out-dir")
-    ap.add_argument("--y-bin-um", type=single.positive_float, default=Y_BIN_UM)
-    ap.add_argument("--z-bin-um", type=single.positive_float, default=Z_BIN_UM)
+    ap.add_argument("--y-bin-um", type=single.positive_float, default=Y_BIN_UM,
+                    help="Y bin size in um; default auto-sizes it so the map has no gaps")
+    ap.add_argument("--z-bin-um", type=single.positive_float, default=Z_BIN_UM,
+                    help="Z bin size in um; default auto-sizes it so the map has no gaps")
     ap.add_argument("--scale", choices=["shared", "panel"], default=SCALE)
     ap.add_argument("--log", action="store_true", default=LOG_SCALE)
     ap.add_argument("--max-gap-s", type=single.positive_float, default=MAX_GAP_S,
@@ -412,9 +463,16 @@ def main(argv=None):
         print(f"First slice gap {first_gap:g} um; gap = first gap + hexapod X offset "
               "(hexapod +X assumed to point away from the aperture).")
 
+    y_bin_um, z_bin_um, holes = auto_bins_um(scan, slices, window, a.y_bin_um, a.z_bin_um)
+    how = "auto" if a.y_bin_um is None or a.z_bin_um is None else "set"
+    print(f"Bin size ({how}): Y {y_bin_um:.2f} um x Z {z_bin_um:.2f} um; "
+          f"{holes:.2%} of scanned bins empty.")
+    if holes > AUTO_HOLE_TOL:
+        print("  NOTE: the map still has gaps at this bin size; try larger --y-bin-um/--z-bin-um.")
+
     results = []
     for n, idx in enumerate(slices, 1):
-        res = analyze_slice(scan, idx, window, a.y_bin_um / 1000, a.z_bin_um / 1000,
+        res = analyze_slice(scan, idx, window, y_bin_um / 1000, z_bin_um / 1000,
                             followed=n < len(slices))
         res["n"] = n
         res["stage_title"] = stage_title
@@ -440,9 +498,9 @@ def main(argv=None):
             print(f"    WARNING slice {r['n']}: recorded hexapod X spans {r['x_spread_um']:.1f} um; "
                   f"it may contain more than one X (try a smaller --max-gap-s)")
     z_steps = [r["z_step_um"] for r in results if np.isfinite(r["z_step_um"])]
-    if z_steps and np.median(z_steps) > a.z_bin_um * 1.5:
+    if z_steps and np.median(z_steps) > z_bin_um * 1.5:
         print(f"  NOTE: median Z sample spacing is {np.median(z_steps):.1f} um but the Z bin is "
-              f"{a.z_bin_um:g} um, so the maps will look streaky; try --z-bin-um {np.median(z_steps):.0f}")
+              f"{z_bin_um:g} um, so the maps will look streaky; try --z-bin-um {np.median(z_steps):.0f}")
     best = max(results, key=lambda r: r["peak_v"])
     label = f" (gap {best['gap_um']:.1f} um)" if best["gap_um"] is not None else ""
     print(f"\n  Highest peak: {best['peak_v']:.4g} {V_UNIT} in slice {best['n']}{label} at "
