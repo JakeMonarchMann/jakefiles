@@ -1,4 +1,11 @@
-"""Plot Trawler AIM calibration response and the corresponding FF time history."""
+"""Plot Trawler AIM calibration response and the corresponding FF time history.
+
+Usage:
+    python lens_nudge_response.py [run folder or data CSV] [--out-dir DIR] [--title TEXT] [--no-show]
+
+With no input a file picker opens. Unless --title is given, a box prompts for the unit under test;
+every figure title starts with it and the run date/time (see plot_common.py).
+"""
 
 import argparse
 import re
@@ -8,6 +15,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+if __package__:
+    from .. import plot_common as common
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import plot_common as common
 
 NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 TRAIN = re.compile(
@@ -191,19 +204,27 @@ def resolve_inputs(path: Path) -> tuple[Path, Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run", type=Path, help="Trawler run folder or data CSV")
+    common.setup_stdout()
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("run", nargs="?", help="Trawler run folder or data CSV; omit for a file picker")
     parser.add_argument("--out-dir", type=Path)
-    parser.add_argument("--no-show", action="store_true")
+    common.add_title_arg(parser)
+    parser.add_argument("--no-show", action="store_true", help="save the PNGs without opening windows")
     args = parser.parse_args(argv)
+    run = common.input_path(args.run)
+    if run is None or not run.exists():
+        print(f"No run folder or CSV found: {run}", file=sys.stderr)
+        return 1
     try:
-        csv_path, console_path = resolve_inputs(args.run)
+        csv_path, console_path = resolve_inputs(run)
         samples = calibration_samples(console_path.read_text(encoding="utf-8-sig"))
         fits = fit_response(samples)
         history = load_history(csv_path)
         out = args.out_dir or csv_path.parent / "plots"
         out.mkdir(parents=True, exist_ok=True)
-        title = csv_path.stem.replace("_data_", " ")
+        header = common.title_header(common.get_title(args.title), common.run_time(csv_path))
+        title = f"{header}\n{common.run_name(csv_path)}"
         figures = [
             ("nudge_response", plot_response(samples, fits, title)),
             ("beam_history", plot_history(history, title)),

@@ -1,3 +1,5 @@
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -90,7 +92,7 @@ class SingleSweepTests(unittest.TestCase):
             df, tail = single.load_csv(path)
             self.assertEqual(tail, 10)
             self.assertEqual(len(df), 9)
-            self.assertEqual(single.main([str(path), "--log"]), 0)
+            self.assertEqual(single.main([str(path), "--title", "", "--log"]), 0)
             out_dir = Path(folder) / "heatmaps"
             self.assertGreater((out_dir / "scan_single_sweep_heatmap.png").stat().st_size, 1000)
             results = pd.read_csv(out_dir / "scan_single_sweep_results.csv")
@@ -104,7 +106,7 @@ class SingleSweepTests(unittest.TestCase):
             df = sample_frame()
             df["oscope_voltage_V"] = -.001
             df.to_csv(path, index=False)
-            self.assertEqual(single.main([str(path), "--log"]), 0)
+            self.assertEqual(single.main([str(path), "--title", "", "--log"]), 0)
 
     def test_standalone_rejects_multiple_stage_x_values(self):
         df = sample_frame()
@@ -390,7 +392,7 @@ class MultiSweepTests(unittest.TestCase):
                     return original(fig, path, *args, **kwargs)
 
                 with patch.object(single.plt.Figure, "savefig", capture):
-                    self.assertEqual(multi.main([str(path)]), 0)
+                    self.assertEqual(multi.main([str(path), "--title", ""]), 0)
                 out = Path(folder) / "heatmaps"
                 results = pd.read_csv(out / "fractional_pass_results.csv")
                 np.testing.assert_allclose(results["x_offset_um"], offsets)
@@ -463,7 +465,7 @@ class MultiSweepTests(unittest.TestCase):
             df.to_csv(path, index=False)
             with patch.object(single, "save_heatmap", wraps=single.save_heatmap) as render, \
                     patch.object(single.plt.Figure, "savefig", capture):
-                self.assertEqual(multi.main([str(path), "--scale", "panel", "--log"]), 0)
+                self.assertEqual(multi.main([str(path), "--title", "", "--scale", "panel", "--log"]), 0)
                 self.assertEqual(render.call_count, 2)
             table = pd.read_csv(Path(folder) / "heatmaps" / "multi_pass_results.csv")
             self.assertEqual(table["x_offset_um"].tolist(), [0, 6])
@@ -475,14 +477,89 @@ class MultiSweepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "one.csv"
             sample_frame().to_csv(path, index=False)
-            self.assertEqual(multi.main([str(path)]), 0)
-            self.assertEqual(single.main([str(path)]), 0)
+            self.assertEqual(multi.main([str(path), "--title", ""]), 0)
+            self.assertEqual(single.main([str(path), "--title", ""]), 0)
             out = Path(folder) / "heatmaps"
             standalone = pd.read_csv(out / "one_single_sweep_results.csv")
             grouped = pd.read_csv(out / "one_pass_results.csv")
             for key in ["rows_used", "peak_V", "peak_Y_mm", "peak_Z_mm",
                         "y_min_mm", "y_max_mm", "z_min_mm", "z_max_mm"]:
                 self.assertEqual(standalone.loc[0, key], grouped.loc[0, key])
+
+
+class AutoBinTests(unittest.TestCase):
+    @staticmethod
+    def raster_frame(x_offsets_um):
+        """Snake raster per stage X: Y columns 3 um apart, Z sampled every 0.5 um over 30 um."""
+        seed = sample_frame().iloc[:3]
+        frames = [seed]
+        ys = np.arange(11) * .003
+        zs = np.arange(61) * .0005
+        for offset in x_offsets_um:
+            y = np.repeat(ys, len(zs))
+            z = np.concatenate([zs if i % 2 == 0 else zs[::-1] for i in range(len(ys))])
+            frame = pd.concat([seed.iloc[[0]]] * len(y), ignore_index=True)
+            frame[single.COL_CMD] = "HEXAPOD MOVEINC Z(ZTravel*ZDir)"
+            frame[single.COL_Y], frame[single.COL_Z] = y, z
+            frame[single.COL_V] = .001 + y * z
+            frame[single.COL_X] = 11.4125 + offset / 1000
+            frames.append(frame)
+        df = pd.concat(frames, ignore_index=True)
+        df[single.COL_T] = np.arange(len(df))
+        return df
+
+    def test_auto_bins_cover_the_coarse_axis_and_keep_the_fine_axis(self):
+        df = self.raster_frame([0])
+        sweep = df.iloc[3:]
+        y, z = sweep[single.COL_Y].to_numpy(), sweep[single.COL_Z].to_numpy()
+        window = (y.min(), y.max(), z.min(), z.max())
+        yb, zb, holes = single.auto_bins_um([(y, z, window)])
+        self.assertAlmostEqual(yb, single.AUTO_GROWTH ** 6)  # 2.99 um: the finest that bridges 3 um columns
+        self.assertEqual(zb, 1)
+        self.assertLessEqual(holes, single.AUTO_HOLE_TOL)
+        self.assertGreater(single.hole_fraction(y, z, window, .001, .001), single.AUTO_HOLE_TOL)
+        fixed = single.auto_bins_um([(y, z, window)], y_um=5, z_um=None)
+        self.assertEqual(fixed[:2], (5, 1))
+
+    def test_every_heatmap_cli_auto_sizes_bins_by_default(self):
+        cases = [(single, [0]), (multi, [0]), (multi, [0, 6])]
+        for module, offsets in cases:
+            with self.subTest(module=module.__name__, offsets=offsets), \
+                    tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "raster_data_20260102_030405.csv"
+                self.raster_frame(offsets).to_csv(path, index=False)
+                with patch.object(single, "auto_bins_um", wraps=single.auto_bins_um) as auto, \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(module.main([str(path), "--title", ""]), 0)
+                auto.assert_called_once()
+                self.assertEqual(len(auto.call_args.args[0]), len(offsets))
+                self.assertIn("Bin size (auto): Y 2.99 um x Z 1.00 um; 0.00% of scanned bins empty",
+                              out.getvalue())
+
+
+class TitleTests(unittest.TestCase):
+    def test_every_heatmap_title_starts_with_user_title_and_run_time(self):
+        for module, offsets in [(single, [0]), (multi, [0, 6])]:
+            with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "raster_data_20260102_030405.csv"
+                AutoBinTests.raster_frame(offsets).to_csv(path, index=False)
+                pages = []
+                original = single.plt.Figure.savefig
+
+                def capture(fig, *args, **kwargs):
+                    texts = [ax.get_title() for ax in fig.axes]
+                    if fig._suptitle is not None:
+                        texts.append(fig._suptitle.get_text())
+                    pages.append(texts)
+                    return original(fig, *args, **kwargs)
+
+                with patch.object(single.plt.Figure, "savefig", capture), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(module.main([str(path), "--title", "BG-CY0000-5"]), 0)
+                self.assertEqual(len(pages), 1 if module is single else 4)
+                for texts in pages:
+                    self.assertTrue(any(t.startswith("BG-CY0000-5  |  Run 2026-01-02 03:04:05\n")
+                                        for t in texts), texts)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ Usage:
 With no CSV argument a file picker opens. PNGs and a per-climb summary CSV are saved in a plots folder
 next to the CSV unless --out-dir is given. Unless --title is given, a box prompts for the unit under
 test, pre-filled with BG-CY0000 and the cursor after it. Cancelling the box, or --title "", means no
-title.
+hand-written title. Every figure title starts with it and the run date/time (see plot_common.py).
 
 A climb is one contiguous run of OPTIMIZE rows. Y/Z/X are shown as offsets from the first reading of the
 run (um). Within a climb only settled rows (hex_moving == 0) are used, and rows at the same Y/Z (within
@@ -40,12 +40,18 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.patches import Rectangle
 
-TITLE_PREFIX = "BG-CY0000"  # pre-filled in the title box; type the rest of the unit name after it
+if __package__:
+    from .. import plot_common as common
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import plot_common as common
+
 CMAP = "viridis"
 POINT_BIN_UM = 0.2          # rows within this Y/Z distance count as the same visited point
 MIN_POINT_SAMPLES = 3       # a point needs this many settled rows to be eligible as a climb's peak
 MIN_CLIMB_ROWS = 25         # shorter OPTIMIZE runs are not climbs
 MAX_COLUMNS = 4             # panels per row in the path figure
+TRF_JUMP_MM = 1.0           # a row-to-row hexapod move this big is the TRF being applied, not motion
 
 COL_T, COL_CMD, COL_MOV = "time_elapsed_s", "script_cmd", "hex_moving"
 COL_X, COL_Y, COL_Z, COL_V = "hex_X_mm", "hex_Y_mm", "hex_Z_mm", "oscope_voltage_V"
@@ -66,61 +72,6 @@ class Climb:
 
 
 # ---------------------------------------------------------------------- inputs
-def pick_csv():
-    try:
-        import tkinter
-        from tkinter import filedialog
-
-        root = tkinter.Tk()
-        root.withdraw()
-        f = filedialog.askopenfilename(title="Select Trawler data CSV", filetypes=[("CSV", "*.csv")])
-        root.destroy()
-        return Path(f) if f else None
-    except Exception:
-        return None
-
-
-def ask_title(default=TITLE_PREFIX):
-    """Prompt for the plot title, pre-filled with default and the cursor after it (not selected).
-
-    Returns the entered text, or None if the box was cancelled or no display is available.
-    """
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-    except Exception:
-        return None
-    answer = []
-    root.title("Plot title")
-    root.attributes("-topmost", True)
-    tkinter.Label(root, text="Title for the plots (unit under test):").pack(
-        padx=12, pady=(12, 4), anchor="w")
-    var = tkinter.StringVar(value=default)
-    entry = tkinter.Entry(root, textvariable=var, width=60)
-    entry.pack(padx=12, fill="x")
-
-    def accept(_event=None):
-        answer.append(var.get().strip())
-        root.destroy()
-
-    def cancel(_event=None):
-        root.destroy()
-
-    buttons = tkinter.Frame(root)
-    buttons.pack(padx=12, pady=12, anchor="e")
-    tkinter.Button(buttons, text="OK", width=8, command=accept).pack(side="left", padx=4)
-    tkinter.Button(buttons, text="Cancel", width=8, command=cancel).pack(side="left")
-    root.bind("<Return>", accept)
-    root.bind("<Escape>", cancel)
-    root.protocol("WM_DELETE_WINDOW", cancel)
-    entry.focus_force()
-    entry.icursor("end")
-    entry.selection_clear()
-    root.mainloop()
-    return answer[0] if answer else None
-
-
 def load_csv(path: Path) -> pd.DataFrame:
     """Read the needed columns; drop an unterminated last line (a log still being written)."""
     with path.open("rb") as stream:
@@ -156,9 +107,22 @@ def recipe_values(csv_path: Path) -> dict[str, float]:
 
 
 # -------------------------------------------------------------------- analysis
+def after_trf_change(valid: pd.DataFrame) -> pd.DataFrame:
+    """Rows from after the recipe's HEXAPOD TRF (X0 Y0 Z0 RX180 RY90 RZ0) took effect.
+
+    The CSV does not log the TRF, but the readout jumps by tens of mm when it is applied, so rows up to
+    the last such jump are in the old frame and are dropped.
+    """
+    jump = valid[[COL_X, COL_Y, COL_Z]].diff().abs().max(axis=1) > TRF_JUMP_MM
+    if not jump.any():
+        return valid
+    return valid.loc[jump[jump].index[-1]:].reset_index(drop=True)
+
+
 def add_offsets(df: pd.DataFrame) -> pd.DataFrame:
     """Add x_um/y_um/z_um (offset from the first full X/Y/Z reading) and v_mV; return the valid rows."""
-    valid = df.dropna(subset=[COL_T, COL_X, COL_Y, COL_Z]).copy()
+    valid = df.dropna(subset=[COL_T, COL_X, COL_Y, COL_Z]).reset_index(drop=True)
+    valid = after_trf_change(valid).copy()
     if valid.empty:
         raise ValueError("No rows with hexapod X/Y/Z readings.")
     origin = valid.iloc[0]
@@ -332,19 +296,17 @@ def plot_time_history(df: pd.DataFrame, climbs: list[Climb], params: dict[str, f
 
 # ------------------------------------------------------------------------- main
 def main(argv=None) -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")
+    common.setup_stdout()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", nargs="?")
     ap.add_argument("--out-dir")
-    ap.add_argument("--title", help="hand-written plot title (the unit under test); "
-                    f"omit to be prompted with {TITLE_PREFIX} pre-filled")
+    common.add_title_arg(ap)
     ap.add_argument("--first-gap-um", type=float,
                     help="gap to the goalposts at the run start (um); overrides the recipe")
     ap.add_argument("--no-show", action="store_true", help="save the PNGs without opening windows")
     a = ap.parse_args(argv)
 
-    path = Path(a.csv) if a.csv else pick_csv()
+    path = common.input_path(a.csv)
     if path is None or not path.is_file():
         print(f"No CSV found: {path}")
         return 1
@@ -352,10 +314,7 @@ def main(argv=None) -> int:
     if a.no_show:
         plt.switch_backend("Agg")
 
-    user_title = ask_title() if a.title is None else a.title.strip()
-    if user_title is None:
-        print("No title entered; plots will have no hand-written title.")
-        user_title = ""
+    header = common.title_header(common.get_title(a.title), common.run_time(path))
 
     print(f"Reading {path}")
     try:
@@ -377,9 +336,7 @@ def main(argv=None) -> int:
         print("No recipe FenceHalfMm: fence boxes omitted.")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = re.sub(r"_data_\d+_?\d*$", "", path.stem)
-    heading = f"{user_title}\n" if user_title else ""
-    heading += f"{name} - "
+    heading = f"{header}\n{common.run_name(path)} - "
     summary = summary_frame(climbs)
     summary.to_csv(out_dir / f"{path.stem}_hill_climb_summary.csv", index=False)
     print(summary.round(3).to_string(index=False))

@@ -3,12 +3,14 @@
 From the repository root:
 
 ```powershell
-uv run python "plottin\LensNudgeResponse\lens_nudge_response.py" "C:\Users\jake.mann\Downloads\Center divmin and aim CL_20261017_185456" --no-show
+uv run python "plottin\LensNudgeResponse\lens_nudge_response.py" "C:\Users\jake.mann\Downloads\Center divmin and aim CL_20261017_185456" --title "BG-CY0000-12" --no-show
 ```
 
-Accepts a run folder containing exactly one Trawler data CSV, or the CSV itself.
-The matching console log must be alongside it. Omit `--no-show` to open the plots;
-use `--out-dir` to override the default `plots` folder next to the input.
+Accepts a run folder containing exactly one Trawler data CSV, or the CSV itself
+(omit it to open a file picker). The matching console log must be alongside it.
+Omit `--no-show` to open the plots; use `--out-dir` to override the default
+`plots` folder next to the input. Omit `--title` to be prompted for the unit
+under test; every figure title starts with it and the run date/time.
 
 Outputs (prefixed with the input CSV stem):
 

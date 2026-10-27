@@ -6,7 +6,8 @@ Usage:
 With no CSV argument, a file picker opens. The PNG is saved in a plots folder next to the CSV.
 The optional hand-written title (the unit under test) is printed at the top of the plot. Unless
 --title is given, a box prompts for it, pre-filled with BG-CY0000 and the cursor after it so you
-can type the rest. Cancelling the box, or --title "", means no title.
+can type the rest. Cancelling the box, or --title "", means no hand-written title. The plot title
+also shows the run date/time (see plot_common.py).
 
 The two phases are located from the logged script_cmd text of the recipe:
     walk  : "HEXAPOD MOVEABS X(SweepStartX)" up to (not incl.) "HEXAPOD MOVEABS X(BestX)"
@@ -17,7 +18,6 @@ worse-of(FF_div_x, FF_div_y) position, the quantity the recipe minimises.
 """
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
@@ -25,71 +25,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+if __package__:
+    from .. import plot_common as common
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import plot_common as common
+
 COL_T, COL_CMD, COL_MOV = "time_elapsed_s", "script_cmd", "hex_moving"
 COL_X, COL_DX, COL_DY, COL_FOUND = "hex_X_mm", "ff_div_x_mrad", "ff_div_y_mrad", "ff_beam_found"
 USECOLS = [COL_T, COL_CMD, COL_MOV, COL_X, COL_DX, COL_DY, COL_FOUND]
 POSITION_DECIMALS = 1  # um
-TITLE_PREFIX = "BG-CY0000"  # pre-filled in the title box; type the rest of the unit name after it
 
 PHASES = [
     ("Algorithmic minimum search (walk +X)", r"HEXAPOD\s+MOVEABS\s+X\(SweepStartX\)", r"HEXAPOD\s+MOVEABS\s+X\(BestX\)"),
     ("Broad through-focus sweep", r"HEXAPOD\s+MOVEABS\s+X\(TFStartX\)", r"HEXAPOD\s+MOVEABS\s+X\(WalkBestX\)"),
 ]
-
-
-def pick_csv():
-    try:
-        import tkinter
-        from tkinter import filedialog
-
-        root = tkinter.Tk()
-        root.withdraw()
-        f = filedialog.askopenfilename(title="Select Trawler data CSV", filetypes=[("CSV", "*.csv")])
-        root.destroy()
-        return Path(f) if f else None
-    except Exception:
-        return None
-
-
-def ask_title(default=TITLE_PREFIX):
-    """Prompt for the plot title, pre-filled with default and the cursor after it (not selected).
-
-    Returns the entered text, or None if the box was cancelled or no display is available.
-    """
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-    except Exception:
-        return None
-    answer = []
-    root.title("Plot title")
-    root.attributes("-topmost", True)
-    tkinter.Label(root, text="Title for the plots (unit under test):").pack(
-        padx=12, pady=(12, 4), anchor="w")
-    var = tkinter.StringVar(value=default)
-    entry = tkinter.Entry(root, textvariable=var, width=60)
-    entry.pack(padx=12, fill="x")
-
-    def accept(_event=None):
-        answer.append(var.get().strip())
-        root.destroy()
-
-    def cancel(_event=None):
-        root.destroy()
-
-    buttons = tkinter.Frame(root)
-    buttons.pack(padx=12, pady=12, anchor="e")
-    tkinter.Button(buttons, text="OK", width=8, command=accept).pack(side="left", padx=4)
-    tkinter.Button(buttons, text="Cancel", width=8, command=cancel).pack(side="left")
-    root.bind("<Return>", accept)
-    root.bind("<Escape>", cancel)
-    root.protocol("WM_DELETE_WINDOW", cancel)
-    entry.focus_force()
-    entry.icursor("end")
-    entry.selection_clear()
-    root.mainloop()
-    return answer[0] if answer else None
 
 
 def load_csv(path: Path) -> pd.DataFrame:
@@ -149,27 +99,22 @@ def plot_phase(ax, title: str, rows: pd.DataFrame) -> None:
 
 
 def main(argv=None) -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")
+    common.setup_stdout()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", nargs="?")
     ap.add_argument("--out-dir")
-    ap.add_argument("--title", help="hand-written plot title (the unit under test); "
-                    f"omit to be prompted with {TITLE_PREFIX} pre-filled")
+    common.add_title_arg(ap)
     ap.add_argument("--no-show", action="store_true", help="save the PNG without opening a window")
     a = ap.parse_args(argv)
 
-    path = Path(a.csv) if a.csv else pick_csv()
+    path = common.input_path(a.csv)
     if path is None or not path.is_file():
         print(f"No CSV found: {path}")
         return 1
     out_dir = Path(a.out_dir) if a.out_dir else path.parent / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    user_title = ask_title() if a.title is None else a.title.strip()
-    if user_title is None:
-        print("No title entered; plot will have no hand-written title.")
-        user_title = ""
+    header = common.title_header(common.get_title(a.title), common.run_time(path))
 
     print(f"Reading {path}")
     try:
@@ -193,9 +138,7 @@ def main(argv=None) -> int:
     fig, axes = plt.subplots(len(phases), 1, figsize=(11, 4.5 * len(phases) + 0.5), constrained_layout=True,
                              squeeze=False)
     axes = axes[:, 0]
-    name = re.sub(r"_data_\d+_?\d*$", "", path.stem)
-    head = f"{user_title}\n" if user_title else ""
-    fig.suptitle(f"{head}{name} - Hexapod X divergence", fontsize=14, fontweight="bold")
+    fig.suptitle(f"{header}\n{common.run_name(path)} - Hexapod X divergence", fontsize=14, fontweight="bold")
     for ax, (title, rows) in zip(axes, phases):
         plot_phase(ax, title, rows)
         print(f"{title}: {len(rows)} settled samples")

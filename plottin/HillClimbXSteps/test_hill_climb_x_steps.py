@@ -1,10 +1,12 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.figure
 
 import numpy as np
 import pandas as pd
@@ -122,6 +124,23 @@ class HillClimbTests(unittest.TestCase):
             for bad in (empty, header_only):
                 self.assertEqual(hc.main([str(bad), "--title", "x", "--no-show"]), 1)
             self.assertEqual(hc.main([str(tmp / "missing.csv"), "--title", "x", "--no-show"]), 1)
+
+    def test_cli_titles_start_with_user_title_and_run_time(self):
+        texts = []
+        original = matplotlib.figure.Figure.savefig
+
+        def capture(fig, *args, **kwargs):
+            texts.append(fig._suptitle.get_text())
+            return original(fig, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv = write_run(Path(tmp), make_run(2))
+            with patch.object(matplotlib.figure.Figure, "savefig", capture):
+                self.assertEqual(hc.main([str(csv), "--out-dir", str(Path(tmp) / "out"), "--title", "unit",
+                                          "--no-show"]), 0)
+        self.assertEqual(len(texts), 3)
+        for text in texts:
+            self.assertTrue(text.startswith("unit  |  Run 2026-01-01 00:00:00\nHill Climb - "), text)
 
     def test_log_without_optimize_rows_is_reported(self):
         df = make_run(2)

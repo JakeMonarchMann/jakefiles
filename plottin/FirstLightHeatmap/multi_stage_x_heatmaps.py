@@ -4,11 +4,14 @@ For runs where the hexapod X moves between slices instead, use
 multi_hexapod_x_heatmaps.py.
 
 Usage:
-    python multi_stage_x_heatmaps.py [data.csv] [--out-dir DIR] [--y-bin-um 1] [--z-bin-um 1]
-                                  [--half-window-mm 0.5] [--scale shared|panel] [--log]
+    python multi_stage_x_heatmaps.py [data.csv] [--out-dir DIR] [--title TEXT] [--y-bin-um N]
+                                  [--z-bin-um N] [--half-window-mm 0.5] [--scale shared|panel] [--log]
 
 With no CSV argument a file picker opens. Outputs go in a heatmaps folder next to the CSV
-unless --out-dir is given, in which case that folder is used.
+unless --out-dir is given, in which case that folder is used. Unless --title is given, a box
+prompts for the unit under test; every graph title starts with it and the run date/time.
+Bin sizes are auto-sized as in single_stage_x_heatmap.py (no empty bins inside any pass);
+--y-bin-um / --z-bin-um fix either size.
 Safe on empty, header-only, partially written, or unfinished CSVs.
 All graph titles include starting HEXSTAGE X/Y/Z readbacks from the first
 fully populated stage sample at or before the first MOVEINC scan row.
@@ -31,25 +34,25 @@ import pandas as pd
 from matplotlib.cm import ScalarMappable
 
 if __package__:
+    from .. import plot_common as common
     from . import single_stage_x_heatmap as single
     from .single_stage_x_heatmap import (
         BASE_USECOLS as USECOLS, CMAP, COL_CMD, COL_X,
         COL_Y, COL_Z, SNAKE_TOKEN, V_SCALE, V_UNIT, draw_heatmap, filter_snake,
-        make_norm, plt, starting_stage_title,
+        make_norm, plt, report_sample_spacing, starting_stage_title,
     )
 else:
     import single_stage_x_heatmap as single
     from single_stage_x_heatmap import (
         BASE_USECOLS as USECOLS, CMAP, COL_CMD, COL_X,
         COL_Y, COL_Z, SNAKE_TOKEN, V_SCALE, V_UNIT, draw_heatmap, filter_snake,
-        make_norm, plt, starting_stage_title,
+        make_norm, plt, report_sample_spacing, starting_stage_title,
     )
+    common = single.common
 
 # ---------------------------------------------------------------- parameters
 CSV_PATH = None                 # set a path here to skip the file picker / CLI argument
 OUT_DIR = None                  # None = next to the CSV
-Y_BIN_UM = 1.0                  # heatmap bin size in hexapod Y (um)
-Z_BIN_UM = 1.0                  # heatmap bin size in hexapod Z (um)
 HALF_WINDOW_MM = 0.5            # retained CLI default; a lone X slice now uses measured bounds
 SCALE = "shared"                # "shared" = one color scale for all passes, "panel" = per-panel scale
 LOG_SCALE = False               # log color scale (signal may be ~1 mV or less)
@@ -89,8 +92,8 @@ def pass_span(snake, idx):
     return round(float(np.ptp(y)), 3), round(float(np.ptp(z)), 3)
 
 
-def analyze_pass(snake, idx, x_um, span_y, span_z, ybin_mm, zbin_mm, followed):
-    sub = snake.iloc[idx]
+def pass_window(sub, span_y, span_z):
+    """Expected Y/Z window of a pass, extended to cover any data outside it; returns (window, warnings)."""
     y, z = sub[COL_Y].to_numpy(), sub[COL_Z].to_numpy()
     # The snake starts at the window's (Ymin, Zmin) corner, so the first row anchors the window.
     ylo, zlo = y[0], z[0]
@@ -102,8 +105,14 @@ def analyze_pass(snake, idx, x_um, span_y, span_z, ybin_mm, zbin_mm, followed):
     if z.min() < zlo - EXTEND_TOL_MM or z.max() > zhi + EXTEND_TOL_MM:
         warn.append(f"Z data [{z.min():.4f}, {z.max():.4f}] outside window [{zlo:.4f}, {zhi:.4f}]; axes extended")
         zlo, zhi = min(zlo, z.min()), max(zhi, z.max())
+    return (ylo, yhi, zlo, zhi), warn
 
-    res = single.analyze_sweep(sub, ybin_mm, zbin_mm, bounds=(ylo, yhi, zlo, zhi))
+
+def analyze_pass(snake, idx, x_um, span_y, span_z, ybin_mm, zbin_mm, followed):
+    sub = snake.iloc[idx]
+    z = sub[COL_Z].to_numpy()
+    bounds, warn = pass_window(sub, span_y, span_z)
+    res = single.analyze_sweep(sub, ybin_mm, zbin_mm, bounds=bounds)
     res.update({
         "x_um": x_um, "z_rows_expected": int(round(span_z / zbin_mm)) + 1,
         # A pass the stage moved on from is finished; only the last pass can be cut short.
@@ -140,7 +149,8 @@ def plot_individual(results, out_dir, stem, glob_norm, scale, log):
     for res in results:
         norm = pass_norm(res, glob_norm, scale, log)
         p = out_dir / stem_for(res, stem)
-        paths.append(single.save_heatmap(res, p, res["stage_title"] + "\n" + pass_title(res), norm, log))
+        paths.append(single.save_heatmap(
+            res, p, res["header"] + "\n" + res["stage_title"] + "\n" + pass_title(res), norm, log))
     return paths
 
 
@@ -170,7 +180,7 @@ def plot_summary(results, out_dir, stem, glob_norm, scale, log):
     if scale != "panel" and last_im is not None:
         fig.colorbar(ScalarMappable(norm=glob_norm, cmap=plt.get_cmap(CMAP)), ax=list(flat[:n]),
                      label=f"max scope voltage per bin ({V_UNIT}){' - log' if log else ''}", shrink=0.8)
-    fig.suptitle(f"First light, max voltage per Y/Z bin - {stem}\n"
+    fig.suptitle(f"{results[0]['header']}\nFirst light, max voltage per Y/Z bin - {stem}\n"
                  f"{results[0]['stage_title']}", fontsize=10)
     p = out_dir / f"{stem}_heatmap_summary.png"
     fig.savefig(p, dpi=130)
@@ -191,7 +201,7 @@ def plot_peak_vs_x(results, out_dir, stem):
         ax.set_ylabel(label)
         ax.grid(alpha=0.3)
     axs[-1].set_xlabel("X offset from first pass (\u00b5m)")
-    axs[0].set_title("Peak vs X (hollow marker = partial/incomplete pass)\n"
+    axs[0].set_title(results[0]["header"] + "\nPeak vs X (hollow marker = partial/incomplete pass)\n"
                      + results[0]["stage_title"])
     p = out_dir / f"{stem}_peak_vs_X.png"
     fig.savefig(p, dpi=130)
@@ -200,38 +210,24 @@ def plot_peak_vs_x(results, out_dir, stem):
 
 
 # ------------------------------------------------------------------------ main
-def pick_csv():
-    try:
-        import tkinter
-        from tkinter import filedialog
-
-        root = tkinter.Tk()
-        root.withdraw()
-        f = filedialog.askopenfilename(title="Select Trawler data CSV", filetypes=[("CSV", "*.csv")])
-        root.destroy()
-        return Path(f) if f else None
-    except Exception:
-        return None
-
-
 def main(argv=None):
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")
+    common.setup_stdout()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", nargs="?")
     ap.add_argument("--out-dir")
-    ap.add_argument("--y-bin-um", type=single.positive_float, default=Y_BIN_UM)
-    ap.add_argument("--z-bin-um", type=single.positive_float, default=Z_BIN_UM)
+    common.add_title_arg(ap)
+    single.add_bin_args(ap)
     ap.add_argument("--half-window-mm", type=single.positive_float, default=HALF_WINDOW_MM,
                     help="legacy option; lone X slices now use measured bounds")
     ap.add_argument("--scale", choices=["shared", "panel"], default=SCALE)
     ap.add_argument("--log", action="store_true", default=LOG_SCALE)
     a = ap.parse_args(argv)
 
-    path = Path(a.csv) if a.csv else (Path(CSV_PATH) if CSV_PATH else pick_csv())
+    path = common.input_path(a.csv, CSV_PATH)
     if path is None or not path.is_file():
         print(f"No CSV found: {path}")
         return 1
+    header = common.title_header(common.get_title(a.title), common.run_time(path))
     out_dir = Path(a.out_dir) if a.out_dir else (Path(OUT_DIR) if OUT_DIR else path.parent / "heatmaps")
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = path.stem
@@ -293,18 +289,28 @@ def main(argv=None):
         print("\nOnly one stage X; combining all pre-RBA readings using measured bounds "
               "(--half-window-mm unused).")
 
+    groups = []
+    for idx, _ in runs:
+        sub = snake.iloc[idx]
+        y, z = sub[COL_Y].to_numpy(), sub[COL_Z].to_numpy()
+        window = (pass_window(sub, span_y, span_z)[0] if len(runs) > 1
+                  else (float(y.min()), float(y.max()), float(z.min()), float(z.max())))
+        groups.append((y, z, window))
+    y_bin_um, z_bin_um = single.choose_bins_um(groups, a.y_bin_um, a.z_bin_um)
+
     base = runs[0][1]
     results = []
     for idx, x_um in runs:
         if len(runs) == 1:
-            res = single.analyze_sweep(snake.iloc[idx], a.y_bin_um / 1000, a.z_bin_um / 1000)
+            res = single.analyze_sweep(snake.iloc[idx], y_bin_um / 1000, z_bin_um / 1000)
             res.update({"x_um": x_um, "complete": None, "z_rows_expected": res["nz"],
                         "warn": ["Scan completion unknown: showing all measured sweeps."]})
         else:
-            res = analyze_pass(snake, idx, x_um, span_y, span_z, a.y_bin_um / 1000, a.z_bin_um / 1000,
+            res = analyze_pass(snake, idx, x_um, span_y, span_z, y_bin_um / 1000, z_bin_um / 1000,
                                followed=idx[-1] < len(snake) - 1)
         res["offset"] = round(x_um - base, 3)
         res["stage_title"] = stage_title
+        res["header"] = header
         res["dup"] = 1
         results.append(res)
 
@@ -319,9 +325,7 @@ def main(argv=None):
               f"{status}")
         for w in r["warn"]:
             print(f"    WARNING offset {r['offset']:+.12g}: {w}")
-        if r["y_step_um"] > a.y_bin_um * 1.5:
-            print(f"    NOTE offset {r['offset']:+.12g}: median Y sample spacing is {r['y_step_um']:.1f} um but "
-                  f"Y bin is {a.y_bin_um:g} um, so the map will look streaky; try --y-bin-um {r['y_step_um']:.0f}")
+    report_sample_spacing(results, y_bin_um, z_bin_um)
     found = sorted({r["offset"] for r in results})
     print(f"  Offsets found:    {found}")
     if len(found) > 1:

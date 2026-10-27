@@ -1,11 +1,18 @@
 """One first-light Y/Z heatmap from a Trawler CSV, without splitting by stage X.
 
 Usage:
-    python single_stage_x_heatmap.py [data.csv] [--out-dir DIR]
-                                  [--y-bin-um 1] [--z-bin-um 1] [--log]
+    python single_stage_x_heatmap.py [data.csv] [--out-dir DIR] [--title TEXT]
+                                  [--y-bin-um N] [--z-bin-um N] [--log]
 
 With no CSV argument, a file picker opens. Outputs default to a heatmaps folder
-next to the CSV: one PNG and one peak-results CSV.
+next to the CSV: one PNG and one peak-results CSV. Unless --title is given, a box
+prompts for the unit under test (see plot_common.py); the title line also shows
+the run date/time.
+
+Bin sizes are auto-sized by default (auto_bins_um, shared by every heatmap
+script): the finest, most square Y/Z bins that leave no empty bins inside the
+scanned area. --y-bin-um / --z-bin-um fix either size (the other is still
+auto-sized).
 
 All positioned readings from the first sweep until the first recorded RBA motion
 are combined, including MOVEUNTIL spirals, dwells, and pre-RBA optimization.
@@ -27,9 +34,9 @@ The title reports PACKAGE X/Y and HEXSTAGE X/Y/Z from the last settled,
 fully populated row before the first hexapod move, plus the nominal hexapod
 pose. These are recorded readbacks, not inferred coordinate transformations.
 An unterminated final CSV line is ignored.
-This module also provides CSV loading, filtering, binning, and heatmap rendering
-for the multi-scan multi_stage_x_heatmaps.py and multi_hexapod_x_heatmaps.py
-entry points.
+This module also provides CSV loading, filtering, bin sizing, binning, and heatmap
+rendering for the multi-scan multi_stage_x_heatmaps.py and
+multi_hexapod_x_heatmaps.py entry points.
 """
 
 import argparse
@@ -48,10 +55,20 @@ import pandas as pd
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.patches import Rectangle
 
+if __package__:
+    from .. import plot_common as common
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import plot_common as common
+
 CSV_PATH = None
 OUT_DIR = None
-Y_BIN_UM = 1.0
-Z_BIN_UM = 1.0
+Y_BIN_UM = None                 # heatmap bin size in hexapod Y (um); None = auto-size so there are no gaps
+Z_BIN_UM = None                 # heatmap bin size in hexapod Z (um); None = auto-size so there are no gaps
+AUTO_HOLE_TOL = 0.002           # auto bins: accept when at most this fraction of scanned bins is empty
+AUTO_GROWTH = 1.2               # auto bins: candidate sizes grow by this factor per step
+AUTO_STEPS = 22                 # auto bins: candidates from 1 um up (1.2**21 = ~46 um)
+STREAKY_RATIO = 1.5             # note when the sample spacing exceeds the bin by this factor
 LOG_SCALE = False
 DISPLAY_MAX_PX = 500
 CMAP = "viridis"
@@ -341,6 +358,8 @@ def analyze_sweep(sweep: pd.DataFrame, ybin_mm: float, zbin_mm: float,
     positive = grid[grid > 0]
     dy = np.abs(np.diff(y))
     dy = dy[(dy > 1e-6) & (dy < 0.05)]
+    dz = np.abs(np.diff(z))
+    dz = dz[(dz > 1e-6) & (dz < 0.05)]
     result = {
         "grid": grid, "rows": len(sweep), "ylo": ylo, "zlo": zlo,
         "yhi": yhi, "zhi": zhi,
@@ -354,6 +373,7 @@ def analyze_sweep(sweep: pd.DataFrame, ybin_mm: float, zbin_mm: float,
         "x_mm": float(sweep[COL_X].median()),
         "z_rows_filled": int(np.unique(iz).size),
         "y_step_um": float(np.median(dy) * 1000) if dy.size else np.nan,
+        "z_step_um": float(np.median(dz) * 1000) if dz.size else np.nan,
     }
     if include_spiral_zoom:
         spiral = spiral_readings(sweep.reset_index(drop=True))
@@ -369,6 +389,81 @@ def analyze_sweep(sweep: pd.DataFrame, ybin_mm: float, zbin_mm: float,
                                    zoom["z_min"] - zpad, zoom["z_max"] + zpad)
             result["spiral_zoom"] = zoom
     return result
+
+
+def hole_fraction(y, z, window, ybin_mm, zbin_mm):
+    """Fraction of empty bins inside the scanned footprint (between each Y column's first and last
+    filled Z bin); the ragged outer edge of the scan is not counted as a hole."""
+    ylo, yhi, zlo, zhi = window
+    ny = max(int(round((yhi - ylo) / ybin_mm)) + 1, 1)
+    nz = max(int(round((zhi - zlo) / zbin_mm)) + 1, 1)
+    iy = np.clip(np.rint((y - ylo) / ybin_mm).astype(np.int64), 0, ny - 1)
+    iz = np.clip(np.rint((z - zlo) / zbin_mm).astype(np.int64), 0, nz - 1)
+    filled = np.zeros((nz, ny), bool)
+    filled[iz, iy] = True
+    cols = np.flatnonzero(filled.any(axis=0))
+    if cols.size < 2:
+        return 1.0
+    first = filled.argmax(axis=0)
+    last = nz - 1 - filled[::-1].argmax(axis=0)
+    x = np.arange(cols[0], cols[-1] + 1)
+    lo = np.interp(x, cols, first[cols])
+    hi = np.interp(x, cols, last[cols])
+    zz = np.arange(nz)[:, None]
+    inside = (zz >= np.ceil(lo)) & (zz <= np.floor(hi))
+    block = filled[:, cols[0]:cols[-1] + 1]
+    return float((inside & ~block).sum() / max(inside.sum(), 1))
+
+
+def auto_bins_um(groups, y_um=None, z_um=None, tol=AUTO_HOLE_TOL):
+    """Finest, most square Y/Z bin sizes (um) that leave no holes in any heatmap.
+
+    groups holds (y_mm, z_mm, window) per heatmap, window being its (ylo, yhi, zlo, zhi) in mm.
+    A size given by the user is kept and only the other axis is searched.
+    Returns (y_bin_um, z_bin_um, worst hole fraction)."""
+    groups = list(groups)
+    sizes = [AUTO_GROWTH ** k for k in range(AUTO_STEPS)]
+    y_opts = [y_um] if y_um else sizes
+    z_opts = [z_um] if z_um else sizes
+    combos = sorted(((yb, zb) for yb in y_opts for zb in z_opts), key=lambda c: (max(c), c[0] * c[1]))
+    worst = 1.0
+    for yb, zb in combos:
+        worst = 0.0
+        for y, z, window in groups:
+            worst = max(worst, hole_fraction(y, z, window, yb / 1000, zb / 1000))
+            if worst > tol:
+                break
+        else:
+            return yb, zb, worst
+    return combos[-1][0], combos[-1][1], worst
+
+
+def choose_bins_um(groups, y_um=None, z_um=None) -> tuple[float, float]:
+    """Resolve --y-bin-um/--z-bin-um (None = auto) for every heatmap of a run and report the choice."""
+    y_bin_um, z_bin_um, holes = auto_bins_um(groups, y_um, z_um)
+    how = "set" if y_um and z_um else "auto"
+    print(f"Bin size ({how}): Y {y_bin_um:.2f} um x Z {z_bin_um:.2f} um; "
+          f"{holes:.2%} of scanned bins empty.")
+    if holes > AUTO_HOLE_TOL:
+        print("  NOTE: the map still has gaps at this bin size; try larger --y-bin-um/--z-bin-um.")
+    return y_bin_um, z_bin_um
+
+
+def report_sample_spacing(results, y_bin_um, z_bin_um) -> None:
+    """Note when the median sample spacing is much coarser than the bin (a streaky map)."""
+    for axis, size in (("y", y_bin_um), ("z", z_bin_um)):
+        steps = [r[f"{axis}_step_um"] for r in results if np.isfinite(r[f"{axis}_step_um"])]
+        if steps and np.median(steps) > size * STREAKY_RATIO:
+            step = float(np.median(steps))
+            print(f"  NOTE: median {axis.upper()} sample spacing is {step:.1f} um but the {axis.upper()} "
+                  f"bin is {size:g} um, so the maps will look streaky; try --{axis}-bin-um {step:.0f}")
+
+
+def add_bin_args(parser) -> None:
+    """--y-bin-um/--z-bin-um, identical in every heatmap script."""
+    for axis, default in (("y", Y_BIN_UM), ("z", Z_BIN_UM)):
+        parser.add_argument(f"--{axis}-bin-um", type=positive_float, default=default,
+                            help=f"{axis.upper()} bin size in um; default auto-sizes it so the map has no gaps")
 
 
 def max_pool(grid, max_px):
@@ -523,39 +618,31 @@ def positive_float(value: str) -> float:
     return number
 
 
-def pick_csv() -> Path | None:
-    import tkinter
-    from tkinter import filedialog
-
-    root = tkinter.Tk()
-    root.withdraw()
-    try:
-        selected = filedialog.askopenfilename(title="Select single-sweep Trawler CSV",
-                                             filetypes=[("CSV", "*.csv")])
-    finally:
-        root.destroy()
-    return Path(selected) if selected else None
-
-
 def main(argv=None) -> int:
+    common.setup_stdout()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", nargs="?")
     ap.add_argument("--out-dir")
-    ap.add_argument("--y-bin-um", type=positive_float, default=Y_BIN_UM)
-    ap.add_argument("--z-bin-um", type=positive_float, default=Z_BIN_UM)
+    common.add_title_arg(ap)
+    add_bin_args(ap)
     ap.add_argument("--log", action="store_true", default=LOG_SCALE)
     args = ap.parse_args(argv)
+    path = common.input_path(args.csv, CSV_PATH, "Select single-sweep Trawler CSV")
+    if path is None or not path.is_file():
+        print(f"No CSV found: {path}", file=sys.stderr)
+        return 1
+    header = common.title_header(common.get_title(args.title), common.run_time(path))
     try:
-        path = Path(args.csv) if args.csv else (Path(CSV_PATH) if CSV_PATH else pick_csv())
-        if path is None or not path.is_file():
-            print(f"No CSV found: {path}", file=sys.stderr)
-            return 1
         df, tail_bytes = load_csv(path)
         if tail_bytes:
             print(f"Dropped unterminated last line ({tail_bytes} bytes).")
         sweep, nominal = select_sweep(df)
-        res = analyze_sweep(sweep, args.y_bin_um / 1000, args.z_bin_um / 1000)
+        y, z = sweep[COL_Y].to_numpy(), sweep[COL_Z].to_numpy()
+        window = (float(y.min()), float(y.max()), float(z.min()), float(z.max()))
+        y_bin_um, z_bin_um = choose_bins_um([(y, z, window)], args.y_bin_um, args.z_bin_um)
+        res = analyze_sweep(sweep, y_bin_um / 1000, z_bin_um / 1000)
+        report_sample_spacing([res], y_bin_um, z_bin_um)
         res["xyz_optimizer_peak"] = xyz_optimizer_peak(sweep)
         log = args.log and np.isfinite(res["pos_min"])
         if args.log and not log:
@@ -564,8 +651,9 @@ def main(argv=None) -> int:
         out_dir = Path(args.out_dir) if args.out_dir else (
             Path(OUT_DIR) if OUT_DIR else path.parent / "heatmaps")
         out_dir.mkdir(parents=True, exist_ok=True)
+        title = header + "\n" + sweep_title(res, nominal)
         png_out = out_dir / f"{path.stem}_single_sweep_heatmap.png"
-        save_heatmap(res, png_out, sweep_title(res, nominal), norm, log)
+        save_heatmap(res, png_out, title, norm, log)
         csv_out = out_dir / f"{path.stem}_single_sweep_results.csv"
         record = {
             "rows_used": res["rows"], "peak_V": res["peak_v"] / V_SCALE,
@@ -579,10 +667,10 @@ def main(argv=None) -> int:
             record.update({f"xyz_optimize_best_{key}": value
                            for key, value in res["xyz_optimizer_peak"].items()})
         pd.DataFrame([record]).to_csv(csv_out, index=False)
-    except (OSError, ValueError, pd.errors.ParserError, ImportError) as exc:
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
         print(f"Could not produce single-sweep heatmap: {exc}", file=sys.stderr)
         return 1
-    print(f"\n{sweep_title(res, nominal)}\nRows used: {res['rows']}")
+    print(f"\n{title}\nRows used: {res['rows']}")
     print(f"\nSaved:\n  {png_out}\n  {csv_out}")
     return 0
 

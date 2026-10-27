@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import matplotlib
 
@@ -57,7 +58,7 @@ class NudgeResponseTests(unittest.TestCase):
             data.to_csv(csv, index=False)
             console = root / "run_console_log_20261017_185456.txt"
             console.write_text(training_log("HEXSTAGE"), encoding="utf-8")
-            self.assertEqual(plotter.main([str(root), "--no-show"]), 0)
+            self.assertEqual(plotter.main([str(root), "--title", "unit", "--no-show"]), 0)
             out = root / "plots"
             self.assertEqual(len(list(out.glob("*.png"))), 2)
             for image in out.glob("*.png"):
@@ -68,6 +69,18 @@ class NudgeResponseTests(unittest.TestCase):
             fig = plotter.plot_history(history, "test")
             self.assertEqual(len(fig.axes[1].lines[0].get_xdata()), 3)
             plotter.plt.close(fig)
+            texts = []
+            original = plotter.plt.Figure.savefig
+
+            def capture(fig, *args, **kwargs):
+                texts.append(fig._suptitle.get_text())
+                return original(fig, *args, **kwargs)
+
+            with patch.object(plotter.plt.Figure, "savefig", capture):
+                self.assertEqual(plotter.main([str(csv), "--title", "unit", "--no-show"]), 0)
+            self.assertEqual(len(texts), 2)
+            for text in texts:
+                self.assertTrue(text.startswith("unit  |  Run 2026-10-17 18:54:56\nrun\n"), text)
             data.loc[0, "ff_div_x_mrad"] = np.nan
             data.to_csv(csv, index=False)
             with self.assertRaisesRegex(ValueError, "missing or non-finite"):

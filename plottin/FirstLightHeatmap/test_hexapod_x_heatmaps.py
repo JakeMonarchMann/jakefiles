@@ -79,7 +79,7 @@ class TitleTests(unittest.TestCase):
             return original(fig, path, *args, **kwargs)
 
         with patch.object(hexx.single.plt.Figure, "savefig", capture), \
-                patch.object(hexx, "ask_title", ask or Mock(side_effect=AssertionError("prompted"))):
+                patch.object(hexx.common, "ask_title", ask or Mock(side_effect=AssertionError("prompted"))):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 code = hexx.main([str(self.path), "--y-bin-um", "2", "--z-bin-um", "2", *argv])
@@ -90,7 +90,7 @@ class TitleTests(unittest.TestCase):
         texts, _ = self.captured_titles(["--title", "BG-CY000-12 unit A"])
         self.assertEqual(len(texts), 4)  # 2 slices + summary + peak vs X
         for page in texts:
-            self.assertTrue(any(t.startswith("BG-CY000-12 unit A\n") for t in page), page)
+            self.assertTrue(any(t.startswith("BG-CY000-12 unit A  |  Run 20") for t in page), page)
         table = pd.read_csv(self.table_path)
         self.assertEqual(table["title"].tolist(), ["BG-CY000-12 unit A"] * 2)
 
@@ -98,15 +98,16 @@ class TitleTests(unittest.TestCase):
         texts, _ = self.captured_titles(["--title", ""])
         for page in texts:
             self.assertFalse(any(t.startswith("\n") for t in page), page)
+            self.assertTrue(any(t.startswith("Run 20") for t in page), page)
         self.assertTrue(pd.read_csv(self.table_path)["title"].isna().all())
 
     def test_missing_title_prompts_with_default_and_uses_answer(self):
-        ask = Mock(return_value="BG-CY000-7")
+        ask = Mock(return_value="BG-CY0000-7")
         texts, _ = self.captured_titles([], ask=ask)
         ask.assert_called_once_with()
-        self.assertEqual(hexx.TITLE_PREFIX, "BG-CY000")
-        self.assertTrue(any(t.startswith("BG-CY000-7\n") for t in texts[0]))
-        self.assertEqual(pd.read_csv(self.table_path)["title"].tolist(), ["BG-CY000-7"] * 2)
+        self.assertEqual(hexx.common.TITLE_PREFIX, "BG-CY0000")
+        self.assertTrue(any(t.startswith("BG-CY0000-7  |  Run ") for t in texts[0]))
+        self.assertEqual(pd.read_csv(self.table_path)["title"].tolist(), ["BG-CY0000-7"] * 2)
 
     def test_cancelled_prompt_runs_without_title(self):
         _, text = self.captured_titles([], ask=Mock(return_value=None))
@@ -115,7 +116,7 @@ class TitleTests(unittest.TestCase):
 
     def test_bad_csv_path_does_not_prompt(self):
         ask = Mock(side_effect=AssertionError("prompted"))
-        with patch.object(hexx, "ask_title", ask), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(hexx.common, "ask_title", ask), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(hexx.main([str(Path(self.folder.name) / "nope.csv")]), 1)
         ask.assert_not_called()
 
@@ -135,11 +136,11 @@ class TitleTests(unittest.TestCase):
 
         try:
             with patch.object(tkinter.Tk, "mainloop", fake_mainloop):
-                answer = hexx.ask_title()
+                answer = hexx.common.ask_title()
         except tkinter.TclError:
             self.skipTest("no display available")
-        self.assertEqual(seen, {"text": "BG-CY000", "cursor": 8, "selected": False})
-        self.assertEqual(answer, "BG-CY000-12 unit A")
+        self.assertEqual(seen, {"text": "BG-CY0000", "cursor": 9, "selected": False})
+        self.assertEqual(answer, "BG-CY0000-12 unit A")
 
 
 class HexapodXSliceTests(unittest.TestCase):
