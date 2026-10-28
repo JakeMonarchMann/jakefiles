@@ -36,9 +36,3 @@ run reports 10-frame averaging initially and changes to 25 samples before the
 focus walk. Therefore the time traces, including divergence during motion, are
 not used as settled sensitivity fits or evidence of a focus optimum. The
 exported TIFF is a final snapshot, not a per-nudge image sequence.
-
-Validation:
-
-```powershell
-uv run python -m unittest plottin.LensNudgeResponse.test_lens_nudge_response
-```

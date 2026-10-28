@@ -8,8 +8,8 @@ Conventions:
       The run time comes from the YYYYMMDD_HHMMSS stamp in the file name (Trawler logs), else the
       file's modified time.
 
-Scripts import this module both when run directly and when imported as part of the plottin package
-(tests): see the import block at the top of each script.
+Scripts import this module both when run directly and when imported as part of the plottin package:
+see the import block at the top of each script.
 """
 import re
 import sys
