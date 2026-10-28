@@ -1,8 +1,8 @@
 """Plot a Trawler "Lens Aperture YZ Hill Climb X Steps" log: three PNGs.
 
 The recipe hill-climbs the PicoScope voltage (OPTIMIZE MAXIMIZE OSCOPE_VOLTAGE) in hexapod Y/Z,
-steps hexapod X 1 um toward the goalposts (HEXAPOD MOVEABS X), and climbs again. There is no raster,
-so the heatmap scripts do not apply. This script gives:
+steps hexapod X in 1 um increments (HEXAPOD MOVEABS X), and climbs again. There is no raster, so the
+heatmap scripts do not apply. This script gives:
 
     1. peak voltage vs hexapod X step (top axis: gap to the goalposts, when the recipe is found)
     2. the Y/Z path of every climb coloured by voltage, with the search fence and the total cap
@@ -22,10 +22,11 @@ run (um). Within a climb only settled rows (hex_moving == 0) are used, and rows 
 POINT_BIN_UM) are collapsed to one point holding their median voltage, so the peak is the best point
 rather than the luckiest noisy sample. Points need MIN_POINT_SAMPLES rows to count as the peak.
 
-If the matching run .txt recipe is found, its CadX, GoalpostCadMm, FenceHalfMm and TotalCapMm give the gap
-to the goalposts (GoalpostCadMm + X - CadX at the run start) and the fence/cap boxes. Each climb's fence
-is +/- FenceHalfMm around where the previous climb parked (the run start for the first), cut back to the
-+/- TotalCapMm cap around the start. Safe on header-only, partial or still-running logs.
+If the matching run .txt recipe is found, its CadX and numeric GoalpostCadMm give the gap from CAD
+nominal. If GoalpostCadMm is an expression, StartGapTargetUm anchors the first scan and measured X
+changes give the gap for later climbs. FenceHalfMm and TotalCapMm give the fence/cap boxes. Each climb's
+fence is +/- FenceHalfMm around where the previous climb parked (the run start for the first), cut back
+to the +/- TotalCapMm cap around the start. Safe on header-only, partial or still-running logs.
 """
 import argparse
 import re
@@ -99,7 +100,7 @@ def recipe_values(csv_path: Path) -> dict[str, float]:
         return {}
     text = recipe.read_text(encoding="utf-8-sig", errors="replace")
     values = {}
-    for name in ("CadX", "GoalpostCadMm", "FenceHalfMm", "TotalCapMm"):
+    for name in ("CadX", "GoalpostCadMm", "StartGapTargetUm", "FenceHalfMm", "TotalCapMm"):
         match = re.search(rf"^\s*{name}\s*=\s*(-?\d+(?:\.\d+)?)", text, re.MULTILINE)
         if match:
             values[name] = float(match.group(1))
@@ -193,7 +194,8 @@ def summary_frame(climbs: list[Climb]) -> pd.DataFrame:
 # ----------------------------------------------------------------------- plots
 def plot_peak_vs_x(climbs: list[Climb], first_gap_um: float | None, heading: str):
     fig, ax = plt.subplots(figsize=(11, 5.5), constrained_layout=True)
-    x = np.array([c.x_um for c in climbs])
+    x_offset = np.array([c.x_um for c in climbs])
+    x = x_offset if first_gap_um is None else x_offset + first_gap_um
     start = np.array([c.start["v_mV"] for c in climbs])
     peak = np.array([c.peak["v_mV"] for c in climbs])
     sd = np.nan_to_num(np.array([c.peak["v_sd"] for c in climbs], dtype=float))
@@ -204,13 +206,16 @@ def plot_peak_vs_x(climbs: list[Climb], first_gap_um: float | None, heading: str
     best = int(np.argmax(peak))
     ax.plot(x[best], peak[best], "*", color="gold", markeredgecolor="black", markersize=18, zorder=5,
             label=f"Best: {peak[best]:.3f} mV at X {round(x[best], 1) + 0.0:+.1f} um")
-    ax.set_xlabel("Hexapod X offset from run start (um); -X is toward the goalposts")
+    if first_gap_um is None:
+        ax.set_xlabel("Hexapod X offset from run start (um); -X is toward the goalposts")
+    else:
+        ax.set_xlabel("Gap to the goalposts (um)")
+        top = ax.secondary_xaxis("top", functions=(lambda v: v - first_gap_um,
+                                                   lambda v: v + first_gap_um))
+        top.set_xlabel("Hexapod X offset from run start (um)")
     ax.set_ylabel("Scope voltage (mV)")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9)
-    if first_gap_um is not None:
-        top = ax.secondary_xaxis("top", functions=(lambda v: v + first_gap_um, lambda v: v - first_gap_um))
-        top.set_xlabel("Gap to the goalposts (um, counted from CAD nominal)")
     fig.suptitle(f"{heading}Peak light vs hexapod X", fontsize=14, fontweight="bold")
     return fig
 
@@ -281,16 +286,13 @@ def plot_time_history(df: pd.DataFrame, climbs: list[Climb], params: dict[str, f
                                   (axes[3], "z_um", "Hexapod Z offset (um)", "#8a4fd0")):
         ax.plot(t, df[col], color=color, linewidth=0.8)
         ax.set_ylabel(label)
-        if cap is not None and col != "x_um":
-            for edge in (-cap, cap):
-                ax.axhline(edge, color="#888888", linestyle=":", linewidth=1)
     axes[3].set_xlabel("Time since log start (s)")
     for ax in axes:
         ax.grid(True, alpha=0.3)
         for c in climbs[::2]:
             ax.axvspan(c.rows[COL_T].iloc[0], c.rows[COL_T].iloc[-1], color="#999999", alpha=0.12, lw=0)
-    fig.suptitle(f"{heading}Hill climb time history (shaded = every other climb"
-                 f"{', dotted = total cap' if cap is not None else ''})", fontsize=13, fontweight="bold")
+    fig.suptitle(f"{heading}Hill climb time history (shaded = every other climb)",
+                 fontsize=13, fontweight="bold")
     return fig
 
 
@@ -323,7 +325,12 @@ def main(argv=None) -> int:
         first_gap = a.first_gap_um
         if first_gap is None and {"CadX", "GoalpostCadMm"} <= params.keys():
             first_gap = (params["GoalpostCadMm"] + (df[COL_X].iloc[0] - params["CadX"])) * 1000
-        climbs = build_climbs(optimize_runs(df), first_gap)
+        runs = optimize_runs(df)
+        if first_gap is None and "StartGapTargetUm" in params:
+            first_scan = next((run for run in runs if not point_table(run).empty), None)
+            if first_scan is not None:
+                first_gap = params["StartGapTargetUm"] - float(first_scan["x_um"].median())
+        climbs = build_climbs(runs, first_gap)
         if not climbs:
             raise ValueError("No OPTIMIZE climbs with settled readings in this log.")
     except (OSError, ValueError, pd.errors.ParserError) as e:
@@ -331,7 +338,7 @@ def main(argv=None) -> int:
         return 1
 
     if first_gap is None:
-        print("No recipe CadX/GoalpostCadMm and no --first-gap-um: gap axis omitted.")
+        print("No usable recipe gap target and no --first-gap-um: gap axis omitted.")
     if "FenceHalfMm" not in params:
         print("No recipe FenceHalfMm: fence boxes omitted.")
 

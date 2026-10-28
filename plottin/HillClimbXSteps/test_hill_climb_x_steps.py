@@ -72,6 +72,26 @@ class HillClimbTests(unittest.TestCase):
         self.assertAlmostEqual(climb.park["y_um"], 2.0, places=1)
         self.assertAlmostEqual(climb.start["y_um"], 0.0, places=1)
 
+    def test_goalpost_gap_is_primary_x_axis(self):
+        climbs = self.climbs(make_run(3))
+        fig = hc.plot_peak_vs_x(climbs, 24.0, "")
+        ax = fig.axes[0]
+        self.assertEqual(ax.get_xlabel(), "Gap to the goalposts (um)")
+        self.assertEqual(ax.child_axes[0].get_xlabel(), "Hexapod X offset from run start (um)")
+        np.testing.assert_allclose(ax.lines[0].get_xdata(), [24, 23, 22])
+        hc.plt.close(fig)
+
+    def test_time_history_y_and_z_axes_scale_to_movement_data(self):
+        df = hc.add_offsets(make_run(3))
+        climbs = hc.build_climbs(hc.optimize_runs(df), 24.0)
+        fig = hc.plot_time_history(df, climbs, {"TotalCapMm": 0.050}, "")
+        for ax, column in zip(fig.axes[2:], ("y_um", "z_um")):
+            low, high = ax.get_ylim()
+            self.assertLess(high - low, 50)
+            self.assertLessEqual(low, df[column].min())
+            self.assertGreaterEqual(high, df[column].max())
+        hc.plt.close(fig)
+
     def test_fence_follows_previous_park_and_is_cut_by_the_cap(self):
         climbs = self.climbs(make_run(2))
         params = {"FenceHalfMm": 0.020, "TotalCapMm": 0.050}
@@ -89,6 +109,21 @@ class HillClimbTests(unittest.TestCase):
             values = hc.recipe_values(csv)
         self.assertEqual(values, {"CadX": 15.682, "GoalpostCadMm": 0.056,
                                   "FenceHalfMm": 0.02, "TotalCapMm": 0.05})
+
+    def test_cli_uses_start_gap_target_when_goalpost_is_an_expression(self):
+        df = make_run(10)
+        optimize_indices = df.index[df[hc.COL_CMD].str.startswith("OPTIMIZE")].to_numpy()
+        for stage, indices in enumerate(np.array_split(optimize_indices, 10)):
+            df.loc[indices, hc.COL_X] = 15.657 + stage * 0.005
+        df.loc[df.index[0], hc.COL_X] = 15.682
+        recipe = ("CadX = 15.682\nStartGapTargetUm = 5\n"
+                  "GoalpostCadMm = GapFromWallMm + (CadX - PreMoveHexapodX)\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            csv = write_run(Path(tmp), df, recipe)
+            out = Path(tmp) / "out"
+            self.assertEqual(hc.main([str(csv), "--out-dir", str(out), "--title", "unit", "--no-show"]), 0)
+            summary = pd.read_csv(next(out.glob("*summary.csv")))
+        np.testing.assert_allclose(summary["gap_um"], np.arange(5, 51, 5), atol=0.01)
 
     def test_cli_saves_three_pngs_and_summary_with_recipe_gap(self):
         with tempfile.TemporaryDirectory() as tmp:
