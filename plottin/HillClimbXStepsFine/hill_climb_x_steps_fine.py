@@ -6,7 +6,8 @@ at that peak +/- FineSideSteps steps, and ends with one fine Y/Z climb at the fi
 
     1. homing_in    light vs gap for every climb, one colour per phase, the point each phase picked and
                     arrows from pick to pick; under it a funnel of the X points each phase visited inside
-                    the window it was allowed to search, narrowing onto the peak
+                    the window it was allowed to search, narrowing onto the peak (a pick at the edge
+                    of what its phase visited is flagged in red: the peak may lie beyond it)
     2. convergence  per phase: the picked gap (+/- half the X step), the X step and range halving, the
                     light picked and its spread across the phase, and the Y/Z each climb parked at
     3. time_history voltage, gap, Y and Z against time, each climb shaded in its phase colour
@@ -58,6 +59,7 @@ else:
 FINAL = 99                  # phase key of the final climb (coarse is 0, fine rounds are 1..FineRounds)
 READ_WINDOW_S = 3.0         # the parked read is taken within this long after a climb ends
 PICK_MATCH_MM = 0.002       # a go-to-peak move must land this close to a climb's parked point to name it
+EDGE_TOL_UM = 0.1           # a pick this close to the nearest/farthest X its phase visited is "at the edge"
 FINAL_COLOR = "#ffcc00"
 PHASE_CMAP = "plasma"
 
@@ -106,6 +108,14 @@ class Phase:
     @property
     def tick(self) -> str:
         return f"{self.label}\n" + ("Y/Z only" if self.step_um is None else f"{self.step_um:.3g} um step")
+
+    @property
+    def at_edge(self) -> bool:
+        """The pick is the nearest or farthest X the phase visited: the peak may lie outside its window."""
+        gaps = [c.gap_um for c in self.climbs]
+        if self.key == FINAL or len(gaps) < 3:
+            return False
+        return min(abs(self.best.gap_um - min(gaps)), abs(self.best.gap_um - max(gaps))) < EDGE_TOL_UM
 
 
 @dataclass
@@ -278,7 +288,7 @@ def build_phases(climbs: list[Climb], params: dict[str, float], ref: GapRef) -> 
     for key in keys:
         members = [c for c in climbs if c.phase == key]
         pick = script_pick(members, [c for c in climbs if c.phase > key])
-        confirmed = pick is not None
+        confirmed = pick is not None or key == FINAL
         if pick is None:
             pick = max(members, key=lambda c: c.light_mV)
         color = FINAL_COLOR if key == FINAL else cmap(0.05 + 0.7 * key / max(n_rounds, 1))
@@ -316,7 +326,8 @@ def phase_frame(phases: list[Phase]) -> pd.DataFrame:
                      "visited_um": max(gaps) - min(gaps), "pick_gap_um": p.best.gap_um,
                      "pick_mV": p.best.light_mV, "spread_mV": max(light) - min(light),
                      "pick_y_um": p.best.y_um, "pick_z_um": p.best.z_um,
-                     "pick_from": "script went there" if p.confirmed else "highest light"})
+                     "pick_from": "script went there" if p.confirmed else "highest light",
+                     "at_edge": p.at_edge})
     return pd.DataFrame(rows)
 
 
@@ -369,8 +380,10 @@ def plot_homing_in(phases: list[Phase], ref: GapRef, heading: str):
         funnel.scatter(gaps, np.full(len(gaps), y), s=size, color=p.color, edgecolor="black",
                        linewidth=0.4, zorder=3)
         funnel.plot(p.best.gap_um, y, "*", color=FINAL_COLOR, mec="black", markersize=17, zorder=5)
-        funnel.annotate(f"{p.best.gap_um:.2f}", (p.best.gap_um, y), xytext=(0, 11),
-                        textcoords="offset points", ha="center", fontsize=8, fontweight="bold")
+        edge = p.at_edge
+        funnel.annotate(f"{p.best.gap_um:.2f}" + (" - at window edge" if edge else ""),
+                        (p.best.gap_um, y), xytext=(0, 11), textcoords="offset points", ha="center",
+                        fontsize=8, fontweight="bold", color="#d62728" if edge else "black")
     funnel.plot([p.best.gap_um for p in phases], ys, "-", color="black", linewidth=1, zorder=4)
     funnel.set_yticks(ys, [p.tick for p in phases], fontsize=9)
     funnel.set_ylim(len(phases) - 0.4, -0.6)
@@ -430,8 +443,8 @@ def plot_convergence(phases: list[Phase], ref: GapRef, heading: str):
     ax_light.plot(xs, [p.best.light_mV for p in phases], "*", color=FINAL_COLOR, mec="black",
                   markersize=15, zorder=5)
     ax_light.set_ylabel("Light after the climb (mV)")
-    ax_light.set_title("Picked light (star) and its spread across the phase (bar):\n"
-                       "a shrinking spread means every point tried is near the top", fontsize=10)
+    ax_light.set_title("Picked light (star) and the range of light across the phase's climbs (bar)",
+                       fontsize=10)
 
     for p in phases:
         ax_yz.plot([c.y_um for c in p.climbs], [c.z_um for c in p.climbs], "o", color=p.color,
@@ -536,6 +549,10 @@ def main(argv=None) -> int:
     heading = f"{header}\n{common.run_name(path)} - "
     summary_frame(climbs, phases).to_csv(out_dir / f"{path.stem}_fine_summary.csv", index=False)
     print(phase_frame(phases).round(3).to_string(index=False))
+    for p in phases:
+        if p.at_edge:
+            print(f"Note: {p.label} picked {p.best.gap_um:.2f} um, the edge of the X it visited; "
+                  "the peak may lie beyond its window.")
 
     figures = {
         "homing_in": plot_homing_in(phases, ref, heading),
