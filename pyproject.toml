@@ -10,6 +10,7 @@ dependencies = [
     "pillow",
     "pillow-heif",
     "pyinstaller",
+    "pystray",
     "pywin32; sys_platform == 'win32'",
 ]
 
