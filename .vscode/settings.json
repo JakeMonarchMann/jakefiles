@@ -1,4 +1,5 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:venv",
-    "python.defaultInterpreterPath": "C:/Users/jake.mann/AppData/Local/Programs/Python/Python312/python.exe"
+    "python.defaultInterpreterPath": "C:/Users/jake.mann/AppData/Local/Programs/Python/Python312/python.exe",
+    "chat.editing.autoAcceptDelay": 60
 }
